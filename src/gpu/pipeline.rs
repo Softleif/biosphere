@@ -1,4 +1,5 @@
 use crate::flat_forest::FlatForest;
+use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
 /// GPU representation of a single node (f32/i32, 24 bytes, bytemuck-compatible).
@@ -25,34 +26,69 @@ struct ForestMeta {
     max_depth: u32,
 }
 
-/// A random forest loaded onto the GPU for batched inference.
+/// GPU state shared across all [`GpuForest`] instances forked from the same forest.
 ///
-/// Create with [`GpuForest::from_flat_forest`], then call [`GpuForest::predict`].
-pub struct GpuForest {
+/// Holds the GPU device, compiled pipelines, and static node/meta buffers.
+/// Wrapped in [`Arc`] so [`GpuForest::fork`] avoids re-uploading node data or
+/// recompiling shaders when creating per-thread handles.
+struct GpuForestShared {
     device: wgpu::Device,
     queue: wgpu::Queue,
     traverse_pipeline: wgpu::ComputePipeline,
     reduce_pipeline: wgpu::ComputePipeline,
     traverse_bgl: wgpu::BindGroupLayout,
     reduce_bgl: wgpu::BindGroupLayout,
-    /// Static buffer holding all tree nodes (f32).
+    /// Static buffer holding all tree nodes (f32). Never mutated after upload.
     node_buffer: wgpu::Buffer,
-    /// Static buffer holding forest metadata.
+    /// Static buffer holding forest metadata. Never mutated after upload.
     meta_buffer: wgpu::Buffer,
     n_trees: u32,
+    n_features: u32,
+}
+
+/// A random forest loaded onto the GPU for batched inference.
+///
+/// Create with [`GpuForest::from_flat_forest`], then call [`GpuForest::predict`].
+///
+/// Use [`GpuForest::fork`] to create per-thread handles that share compiled
+/// pipelines and uploaded node data without re-uploading or recompiling.
+/// Each handle has its own pre-allocated GPU inference buffers and is safe
+/// to use from a single thread concurrently with other handles forked from
+/// the same forest.
+pub struct GpuForest {
+    shared: Arc<GpuForestShared>,
+    /// Pre-allocated feature upload buffer (STORAGE | COPY_DST).
+    /// Sized for `max_samples * n_features * 4` bytes.
+    feature_buffer: wgpu::Buffer,
+    /// Pre-allocated intermediate per-tree predictions (STORAGE).
+    /// Sized for `max_samples * n_trees * 4` bytes.
+    per_tree_preds_buffer: wgpu::Buffer,
+    /// Pre-allocated final per-sample means (STORAGE | COPY_SRC).
+    /// Sized for `max_samples * 4` bytes.
+    output_buffer: wgpu::Buffer,
+    /// Pre-allocated CPU-readable staging buffer (COPY_DST | MAP_READ).
+    /// Sized for `max_samples * 4` bytes.
+    staging_buffer: wgpu::Buffer,
+    max_samples: usize,
 }
 
 impl GpuForest {
     /// Upload a [`FlatForest`] to the GPU and compile the compute pipelines.
     ///
+    /// `max_samples` is the maximum batch size for a single [`predict`] call.
+    /// All GPU inference buffers are pre-allocated at this capacity, so individual
+    /// `predict` calls avoid any GPU memory allocation overhead.
+    ///
     /// Node thresholds and leaf values are downcast from f64 to f32.
     /// This may introduce small numerical differences compared to CPU inference
     /// for samples whose feature value is very close to a split threshold.
-    pub fn from_flat_forest(flat: &FlatForest) -> Self {
-        pollster::block_on(Self::from_flat_forest_async(flat))
+    ///
+    /// [`predict`]: GpuForest::predict
+    pub fn from_flat_forest(flat: &FlatForest, max_samples: usize) -> Self {
+        pollster::block_on(Self::from_flat_forest_async(flat, max_samples))
     }
 
-    async fn from_flat_forest_async(flat: &FlatForest) -> Self {
+    async fn from_flat_forest_async(flat: &FlatForest, max_samples: usize) -> Self {
         // --- Device initialisation ---
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let adapter = instance
@@ -159,7 +195,7 @@ impl GpuForest {
             cache: None,
         });
 
-        GpuForest {
+        let shared = Arc::new(GpuForestShared {
             device,
             queue,
             traverse_pipeline,
@@ -169,86 +205,155 @@ impl GpuForest {
             node_buffer,
             meta_buffer,
             n_trees: flat.n_trees as u32,
-        }
-    }
-
-    /// Run batched inference on `n_samples` samples.
-    ///
-    /// `features` is a row-major f32 matrix of shape `(n_samples, n_features)`.
-    /// Returns one f32 prediction per sample (mean of all tree predictions).
-    pub fn predict(&self, features: &[f32], n_samples: usize) -> Vec<f32> {
-        pollster::block_on(self.predict_async(features, n_samples))
-    }
-
-    async fn predict_async(&self, features: &[f32], n_samples: usize) -> Vec<f32> {
-        let device = &self.device;
-        let queue = &self.queue;
-
-        // --- Per-call buffers ---
-        let feature_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("biosphere::gpu::features"),
-            contents: bytemuck::cast_slice(features),
-            usage: wgpu::BufferUsages::STORAGE,
+            n_features: flat.n_features as u32,
         });
 
-        let per_tree_preds_size = (n_samples * self.n_trees as usize * size_of::<f32>()) as u64;
-        let per_tree_preds_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("biosphere::gpu::per_tree_preds"),
-            size: per_tree_preds_size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        Self::alloc_buffers(shared, max_samples)
+    }
+
+    /// Allocate the per-instance inference buffers for `max_samples` capacity.
+    fn alloc_buffers(shared: Arc<GpuForestShared>, max_samples: usize) -> Self {
+        let device = &shared.device;
+        let n_trees = shared.n_trees as usize;
+        let n_features = shared.n_features as usize;
+
+        let feature_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("biosphere::gpu::features"),
+            size: (max_samples * n_features * size_of::<f32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
-        let output_size = (n_samples * size_of::<f32>()) as u64;
+        let per_tree_preds_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("biosphere::gpu::per_tree_preds"),
+            size: (max_samples * n_trees * size_of::<f32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
         let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("biosphere::gpu::output"),
-            size: output_size,
+            size: (max_samples * size_of::<f32>()) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
         let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("biosphere::gpu::staging"),
-            size: output_size,
+            size: (max_samples * size_of::<f32>()) as u64,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
 
-        // --- Bind groups ---
+        GpuForest {
+            shared,
+            feature_buffer,
+            per_tree_preds_buffer,
+            output_buffer,
+            staging_buffer,
+            max_samples,
+        }
+    }
+
+    /// Create a new `GpuForest` handle for use from a separate thread.
+    ///
+    /// The returned handle shares the compiled GPU pipelines and uploaded node
+    /// data with `self` (no recompilation or re-upload). It gets its own
+    /// pre-allocated inference buffers sized for `max_samples`, making it safe
+    /// to call [`predict`] on from a single thread concurrently with `self` or
+    /// any other forked handle.
+    ///
+    /// [`predict`]: GpuForest::predict
+    pub fn fork(&self, max_samples: usize) -> Self {
+        Self::alloc_buffers(Arc::clone(&self.shared), max_samples)
+    }
+
+    /// Run batched inference on `n_samples` samples.
+    ///
+    /// `features` is a row-major f32 slice of shape `(n_samples, n_features)`.
+    /// Returns one f32 prediction per sample (mean of all tree predictions).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n_samples > max_samples` (the value passed to [`from_flat_forest`]).
+    pub fn predict(&self, features: &[f32], n_samples: usize) -> Vec<f32> {
+        if n_samples == 0 {
+            return vec![];
+        }
+        assert!(
+            n_samples <= self.max_samples,
+            "n_samples={n_samples} exceeds max_samples={}",
+            self.max_samples
+        );
+        pollster::block_on(self.predict_async(features, n_samples))
+    }
+
+    async fn predict_async(&self, features: &[f32], n_samples: usize) -> Vec<f32> {
+        let shared = &self.shared;
+        let device = &shared.device;
+        let queue = &shared.queue;
+        let n_features = shared.n_features as usize;
+        let n_trees = shared.n_trees as usize;
+
+        let feature_bytes = (n_samples * n_features * size_of::<f32>()) as u64;
+        let per_tree_bytes = (n_samples * n_trees * size_of::<f32>()) as u64;
+        let output_bytes = (n_samples * size_of::<f32>()) as u64;
+
+        // Upload features into the pre-allocated buffer.
+        queue.write_buffer(&self.feature_buffer, 0, bytemuck::cast_slice(features));
+
+        // Create bind groups with sub-range sizes so that arrayLength() in the
+        // shaders reflects the actual n_samples, not the full max_samples capacity.
         let traverse_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("biosphere::gpu::traverse_bg"),
-            layout: &self.traverse_bgl,
+            label: None,
+            layout: &shared.traverse_bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: self.meta_buffer.as_entire_binding(),
+                    resource: shared.meta_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: self.node_buffer.as_entire_binding(),
+                    resource: shared.node_buffer.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: feature_buffer.as_entire_binding(),
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &self.feature_buffer,
+                        offset: 0,
+                        size: wgpu::BufferSize::new(feature_bytes),
+                    }),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: per_tree_preds_buffer.as_entire_binding(),
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &self.per_tree_preds_buffer,
+                        offset: 0,
+                        size: wgpu::BufferSize::new(per_tree_bytes),
+                    }),
                 },
             ],
         });
 
         let reduce_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("biosphere::gpu::reduce_bg"),
-            layout: &self.reduce_bgl,
+            label: None,
+            layout: &shared.reduce_bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: per_tree_preds_buffer.as_entire_binding(),
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &self.per_tree_preds_buffer,
+                        offset: 0,
+                        size: wgpu::BufferSize::new(per_tree_bytes),
+                    }),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: output_buffer.as_entire_binding(),
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &self.output_buffer,
+                        offset: 0,
+                        size: wgpu::BufferSize::new(output_bytes),
+                    }),
                 },
             ],
         });
@@ -262,10 +367,10 @@ impl GpuForest {
                 label: Some("biosphere::gpu::traverse_pass"),
                 timestamp_writes: None,
             });
-            cpass.set_pipeline(&self.traverse_pipeline);
+            cpass.set_pipeline(&shared.traverse_pipeline);
             cpass.set_bind_group(0, &traverse_bg, &[]);
             let x_groups = n_samples.div_ceil(64) as u32;
-            cpass.dispatch_workgroups(x_groups, self.n_trees, 1);
+            cpass.dispatch_workgroups(x_groups, shared.n_trees, 1);
         }
 
         {
@@ -273,24 +378,32 @@ impl GpuForest {
                 label: Some("biosphere::gpu::reduce_pass"),
                 timestamp_writes: None,
             });
-            cpass.set_pipeline(&self.reduce_pipeline);
+            cpass.set_pipeline(&shared.reduce_pipeline);
             cpass.set_bind_group(0, &reduce_bg, &[]);
             let x_groups = n_samples.div_ceil(64) as u32;
             cpass.dispatch_workgroups(x_groups, 1, 1);
         }
 
-        encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging_buffer, 0, output_size);
-        queue.submit(Some(encoder.finish()));
+        encoder.copy_buffer_to_buffer(&self.output_buffer, 0, &self.staging_buffer, 0, output_bytes);
+        let submit_idx = queue.submit(Some(encoder.finish()));
 
         // --- Read results ---
-        let buffer_slice = staging_buffer.slice(..);
+        // Map only the used portion of the pre-allocated staging buffer.
+        let buffer_slice = self.staging_buffer.slice(..output_bytes);
         buffer_slice.map_async(wgpu::MapMode::Read, |_| {});
+        // Wait for exactly our submission — safe even with a shared device/queue.
         device
-            .poll(wgpu::PollType::wait_indefinitely())
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(submit_idx),
+                timeout: None,
+            })
             .expect("GPU poll failed");
 
         let data = buffer_slice.get_mapped_range();
-        bytemuck::cast_slice::<u8, f32>(&data).to_vec()
+        let result = bytemuck::cast_slice::<u8, f32>(&data).to_vec();
+        drop(data);
+        self.staging_buffer.unmap();
+        result
     }
 }
 

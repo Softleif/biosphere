@@ -22,8 +22,8 @@
 //! let n_features = X.ncols();
 //! let flat = FlatForest::from_forest(&forest, n_features);
 //!
-//! // 3. Upload to the GPU.
-//! let gpu_forest = GpuForest::from_flat_forest(&flat);
+//! // 3. Upload to the GPU, reserving capacity for up to 1024 samples per call.
+//! let gpu_forest = GpuForest::from_flat_forest(&flat, 1024);
 //!
 //! // 4. Run inference. Features must be f32, row-major (n_samples × n_features).
 //! let test_X: Array2<f64> = /* ... your test data ... */

@@ -43,7 +43,7 @@ mod gpu_tests {
         let flat = FlatForest::from_forest(&forest, n_features);
         let cpu_preds = flat.predict(&test_x.view());
 
-        let gpu_forest = GpuForest::from_flat_forest(&flat);
+        let gpu_forest = GpuForest::from_flat_forest(&flat, 100);
         // Convert test features to f32 row-major.
         let features_f32: Vec<f32> = test_x.iter().map(|&v| v as f32).collect();
         let gpu_preds = gpu_forest.predict(&features_f32, 100);
@@ -73,7 +73,7 @@ mod gpu_tests {
         let flat = FlatForest::from_forest(&forest, n_features);
         let cpu_preds = flat.predict(&test_x.view());
 
-        let gpu_forest = GpuForest::from_flat_forest(&flat);
+        let gpu_forest = GpuForest::from_flat_forest(&flat, 1);
         let features_f32: Vec<f32> = test_x.iter().map(|&v| v as f32).collect();
         let gpu_preds = gpu_forest.predict(&features_f32, 1);
 

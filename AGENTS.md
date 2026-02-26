@@ -62,6 +62,19 @@ The `MaxFeatures` enum supports multiple feature sampling strategies:
 - `src/gpu/shaders/reduce.wgsl` — averages per-tree predictions per sample.
 - Tests: `tests/flat_forest.rs` (CPU, no feature flag), `tests/gpu_inference.rs` (requires GPU, `--features gpu`).
 
+**GpuForest API (wgpu 28):**
+- `GpuForest::from_flat_forest(flat: &FlatForest, max_samples: usize) -> GpuForest` — creates GPU buffers sized for up to `max_samples` rows. Pre-allocates 4 buffers at init; no per-call VRAM allocation.
+- `GpuForest::fork(&self, max_samples: usize) -> GpuForest` — clones the `Arc<GpuForestShared>` (device, queue, pipelines, static node/meta buffers) and allocates fresh per-instance buffers. Use this to get per-thread handles without recompiling shaders or re-uploading node data.
+- `GpuForest::predict(features: &[f32], n_samples: usize) -> Vec<f32>` — writes features via `queue.write_buffer`, creates sub-range bind groups so `arrayLength()` in the shader sees `n_samples` (not `max_samples`), submits, waits with `device.poll(PollType::Wait { submission_index: Some(idx), timeout: None })`, reads staging buffer, calls `staging_buffer.unmap()`.
+- Sub-range binding: pass `wgpu::BufferBinding { buffer, offset: 0, size: Some(BufferSize::new(feature_bytes)) }` — this is essential for `arrayLength()` to reflect the actual batch size, not buffer capacity.
+- wgpu 28 poll API: `queue.submit()` returns a `SubmissionIndex`; pass it to `device.poll(PollType::Wait { submission_index: Some(idx), timeout: None })` for per-submission blocking wait.
+- Always call `staging_buffer.unmap()` after reading from a pre-allocated (reused) staging buffer, so the next `encoder.copy_buffer_to_buffer` + map cycle works correctly.
+
+**Thread safety and TLS on Metal/wgpu:**
+- wgpu/Metal GPU resources held in `thread_local!` cause `"cannot access a Thread Local Storage value during or after destruction: AccessError"` when rayon worker threads tear down, because Metal's OS autorelease pool is destroyed before Rust TLS destructors run.
+- Fix: explicitly drop GPU resources in rayon's `exit_handler`, which runs while the thread is still alive (before TLS destructors). Example: `.exit_handler(|_| { GPU_FORESTS.with(|gf| { gf.borrow_mut().take(); }); })`
+- This is cleaner than pre-allocating a `Vec<GpuForest>` indexed by thread, because lazy init and cleanup both stay local to the thread.
+
 **Why not BFS positional encoding (`2i+1`/`2i+2`):**
 Real-world RF trees trained without a `max_depth` constraint are deep and sparse. A positional BFS layout requires `2^(depth+1) - 1` slots per tree — depth ~44 means petabytes of allocation. Explicit child indices allocate only actual nodes.
 
