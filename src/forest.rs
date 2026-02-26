@@ -10,6 +10,7 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use rayon::ThreadPoolBuilder;
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct RandomForestParameters {
     decision_tree_parameters: DecisionTreeParameters,
     n_estimators: usize,
@@ -96,6 +97,8 @@ impl RandomForestParameters {
     }
 }
 
+#[derive(Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct RandomForest {
     random_forest_parameters: RandomForestParameters,
     trees: Vec<DecisionTree>,

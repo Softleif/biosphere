@@ -7,7 +7,7 @@ use std::debug_assert;
 static MIN_GAIN_TO_SPLIT: f64 = 1e-12;
 static FEATURE_THRESHOLD: f64 = 1e-14;
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct DecisionTreeNode {
     pub left_child: Option<Box<DecisionTreeNode>>,
