@@ -37,11 +37,10 @@ impl DecisionTreeNode {
         current_depth: usize,
         parameters: &DecisionTreeParameters,
     ) {
-        if let Some(depth) = parameters.max_depth {
-            if current_depth >= depth {
+        if let Some(depth) = parameters.max_depth
+            && current_depth >= depth {
                 return self.leaf_node(sum / n_samples as f64);
             }
-        }
 
         if n_samples <= parameters.min_samples_split {
             return self.leaf_node(sum / n_samples as f64);
