@@ -29,7 +29,7 @@ struct Meta {
 @group(0) @binding(1) var<storage, read> nodes: array<Node>;
 // features: row-major, shape (n_samples, n_features)
 @group(0) @binding(2) var<storage, read> features: array<f32>;
-// per_tree_preds: row-major, shape (n_samples, n_trees)
+// per_tree_preds: column-major, shape (n_trees, n_samples)
 @group(0) @binding(3) var<storage, read_write> per_tree_preds: array<f32>;
 
 @compute @workgroup_size(64, 1, 1)
@@ -49,7 +49,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var i: u32 = 0u; i <= forest_meta.max_depth; i = i + 1u) {
         let node = nodes[tree_offset + node_idx];
         if node.is_leaf == 1u {
-            per_tree_preds[sample_id * forest_meta.n_trees + tree_id] = node.leaf_value;
+            per_tree_preds[tree_id * n_samples + sample_id] = node.leaf_value;
             return;
         }
         let feat_val = features[sample_id * forest_meta.n_features + node.feature_index];
@@ -61,5 +61,5 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
     // Fallback: should not reach here for well-formed trees.
-    per_tree_preds[sample_id * forest_meta.n_trees + tree_id] = nodes[tree_offset + node_idx].leaf_value;
+    per_tree_preds[tree_id * n_samples + sample_id] = nodes[tree_offset + node_idx].leaf_value;
 }

@@ -66,7 +66,9 @@ impl<'forest> PredictHandle<'forest> {
     pub fn collect(self) -> Vec<f32> {
         let device = &self.forest.shared.device;
         let buffer_slice = self.forest.staging_buffer.slice(..self.output_bytes);
-        buffer_slice.map_async(wgpu::MapMode::Read, |_| {});
+        buffer_slice.map_async(wgpu::MapMode::Read, |result| {
+            result.expect("GPU staging buffer mapping failed");
+        });
         device
             .poll(wgpu::PollType::Wait {
                 submission_index: Some(self.submit_idx),
@@ -146,7 +148,8 @@ impl GpuForest {
             .iter()
             .map(|n| GpuNode {
                 feature_index: n.feature_index,
-                is_leaf: n.is_leaf as u32,
+                // FlatNode no longer carries is_leaf; derive it from left < 0.
+                is_leaf: (n.left < 0) as u32,
                 threshold: n.threshold as f32,
                 leaf_value: n.leaf_value as f32,
                 left: n.left,

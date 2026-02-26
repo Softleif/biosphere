@@ -72,6 +72,8 @@ impl DecisionTree {
 
         let n_samples = samples[0].len();
         let mut all_false = vec![false; X.nrows()];
+        let mut feature_order = Vec::with_capacity(X.ncols());
+        let mut right_scratch = Vec::with_capacity(n_samples);
 
         self.node.split(
             X,
@@ -80,6 +82,8 @@ impl DecisionTree {
             n_samples,
             vec![false; X.ncols()],
             &mut all_false,
+            &mut feature_order,
+            &mut right_scratch,
             sum,
             &mut rng,
             0,
@@ -89,10 +93,14 @@ impl DecisionTree {
 
     pub fn predict(&self, X: &ArrayView2<f64>) -> Array1<f64> {
         let mut predictions = Array1::<f64>::zeros(X.nrows());
-        for row in 0..X.nrows() {
-            predictions[row] = self.predict_row(&X.row(row));
-        }
+        self.predict_into(X, &mut predictions);
         predictions
+    }
+
+    pub fn predict_into(&self, X: &ArrayView2<f64>, out: &mut Array1<f64>) {
+        for row in 0..X.nrows() {
+            out[row] = self.predict_row(&X.row(row));
+        }
     }
 
     pub fn predict_row(&self, X: &ArrayView1<f64>) -> f64 {

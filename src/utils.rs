@@ -8,7 +8,7 @@ use rand::Rng;
 /// data: `Array1<f64>` or `ArrayView1<f64>`
 pub fn argsort(data: &ArrayBase<impl Data<Elem = f64>, Ix1>) -> Vec<usize> {
     let mut indices = (0..data.len()).collect::<Vec<usize>>();
-    indices.sort_unstable_by(|a, b| data[*a].partial_cmp(&data[*b]).unwrap());
+    indices.sort_unstable_by(|a, b| data[*a].total_cmp(&data[*b]));
     indices
 }
 
@@ -56,7 +56,7 @@ pub fn sorted_samples(
 
     for idx in 0..X.ncols() {
         let mut samples_ = samples.to_vec();
-        samples_.sort_by(|a, b| X[[*a, idx]].partial_cmp(&X[[*b, idx]]).unwrap());
+        samples_.sort_by(|a, b| X[[*a, idx]].total_cmp(&X[[*b, idx]]));
         samples_out.push(samples_);
     }
     samples_out

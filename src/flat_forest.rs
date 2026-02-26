@@ -10,28 +10,35 @@ use std::collections::VecDeque;
 ///
 /// Child indices are explicit offsets into the per-tree node slice, so trees
 /// of any shape can be stored without exponential padding.
+///
+/// Field order: traversal-hot fields (`left`, `right`, `feature_index`,
+/// `threshold`) come first, the leaf-only field (`leaf_value`) last.
+/// `is_leaf` was removed — `left < 0` encodes leaf status without redundancy
+/// and without the 3-byte padding hole that `bool` caused before `threshold`.
+///
+/// NOTE: field order is significant for binary serde (e.g. postcard). If you
+/// need binary compatibility with data serialised before this change, a
+/// migration step is required.
 #[derive(Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct FlatNode {
-    pub feature_index: u32,
-    pub is_leaf: bool,
-    pub threshold: f64,
-    pub leaf_value: f64,
     /// Index of the left child within the tree's node slice, or -1 for leaves.
     pub left: i32,
     /// Index of the right child within the tree's node slice, or -1 for leaves.
     pub right: i32,
+    pub feature_index: u32,
+    pub threshold: f64,
+    pub leaf_value: f64,
 }
 
 impl FlatNode {
     fn dummy_leaf() -> Self {
         FlatNode {
-            feature_index: 0,
-            is_leaf: true,
-            threshold: 0.0,
-            leaf_value: 0.0,
             left: -1,
             right: -1,
+            feature_index: 0,
+            threshold: 0.0,
+            leaf_value: 0.0,
         }
     }
 }
@@ -65,7 +72,7 @@ impl FlatNode {
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct FlatForest {
     /// Flat node array: length = `n_trees * max_tree_size`.
-    pub nodes: Vec<FlatNode>,
+    pub(crate) nodes: Vec<FlatNode>,
     pub n_trees: usize,
     pub n_features: usize,
     /// Nodes per tree (all trees padded to this size).
@@ -115,30 +122,31 @@ impl FlatForest {
     /// Run inference on a batch of samples.
     ///
     /// Produces the same results as `RandomForest::predict` (mean of per-tree predictions).
+    ///
+    /// The loop order is outer=tree, inner=sample so that each tree's node array
+    /// stays warm in L3 cache while all samples are processed against it, rather
+    /// than re-loading every tree's nodes for every sample.
     pub fn predict(&self, X: &ArrayView2<f64>) -> Array1<f64> {
         let n_samples = X.nrows();
         let mut output = Array1::<f64>::zeros(n_samples);
 
-        for sample in 0..n_samples {
-            let row = X.row(sample);
-            let features = row.as_slice().expect("feature row must be contiguous");
-
-            let mut sum = 0.0f64;
-            for tree_idx in 0..self.n_trees {
-                sum += self.predict_one(tree_idx, features);
+        for tree_idx in 0..self.n_trees {
+            for sample in 0..n_samples {
+                let row = X.row(sample);
+                let features = row.as_slice().expect("feature row must be contiguous");
+                output[sample] += self.predict_one(tree_idx, features);
             }
-            output[sample] = sum / self.n_trees as f64;
         }
 
-        output
+        output / self.n_trees as f64
     }
 
     fn predict_one(&self, tree_idx: usize, features: &[f64]) -> f64 {
         let offset = tree_idx * self.max_tree_size;
         let mut idx = 0usize;
-        loop {
+        for _ in 0..self.max_tree_size {
             let node = &self.nodes[offset + idx];
-            if node.is_leaf {
+            if node.left < 0 {
                 return node.leaf_value;
             }
             if features[node.feature_index as usize] < node.threshold {
@@ -147,6 +155,10 @@ impl FlatForest {
                 idx = node.right as usize;
             }
         }
+        panic!(
+            "predict_one: traversal exceeded max_tree_size ({}); tree may be malformed",
+            self.max_tree_size
+        );
     }
 }
 
@@ -180,12 +192,11 @@ fn fill_bfs(root: &DecisionTreeNode, nodes: &mut [FlatNode]) {
     while let Some((node, idx)) = queue.pop_front() {
         if node.feature_index.is_none() {
             nodes[idx] = FlatNode {
-                feature_index: 0,
-                is_leaf: true,
-                threshold: 0.0,
-                leaf_value: node.label.unwrap(),
                 left: -1,
                 right: -1,
+                feature_index: 0,
+                threshold: 0.0,
+                leaf_value: node.label.unwrap(),
             };
         } else {
             let left_idx = next_slot;
@@ -194,12 +205,11 @@ fn fill_bfs(root: &DecisionTreeNode, nodes: &mut [FlatNode]) {
             next_slot += 1;
 
             nodes[idx] = FlatNode {
-                feature_index: node.feature_index.unwrap() as u32,
-                is_leaf: false,
-                threshold: node.feature_value.unwrap(),
-                leaf_value: 0.0,
                 left: left_idx as i32,
                 right: right_idx as i32,
+                feature_index: node.feature_index.unwrap() as u32,
+                threshold: node.feature_value.unwrap(),
+                leaf_value: 0.0,
             };
 
             queue.push_back((node.left_child.as_ref().unwrap(), left_idx));

@@ -3,7 +3,7 @@
 // Dispatch: (ceil(n_samples / 64), 1, 1)
 // Workgroup size: (64, 1, 1)
 
-// per_tree_preds: row-major, shape (n_samples, n_trees)
+// per_tree_preds: column-major, shape (n_trees, n_samples)
 @group(0) @binding(0) var<storage, read> per_tree_preds: array<f32>;
 // output: shape (n_samples,)
 @group(0) @binding(1) var<storage, read_write> output: array<f32>;
@@ -20,7 +20,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     var sum: f32 = 0.0;
     for (var t: u32 = 0u; t < n_trees; t = t + 1u) {
-        sum = sum + per_tree_preds[sample_id * n_trees + t];
+        sum = sum + per_tree_preds[t * n_samples + sample_id];
     }
     output[sample_id] = sum / f32(n_trees);
 }

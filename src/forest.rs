@@ -6,7 +6,6 @@ use ndarray::{Array1, ArrayView1, ArrayView2};
 use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use rayon::ThreadPoolBuilder;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 /// Configuration for a [`RandomForest`].
@@ -141,6 +140,19 @@ pub struct RandomForest {
     trees: Vec<DecisionTree>,
 }
 
+fn build_thread_pool(n_jobs: Option<i32>) -> rayon::ThreadPool {
+    let mut builder = rayon::ThreadPoolBuilder::new();
+    let n_threads = match n_jobs {
+        Some(n) if n >= 1 => Some(n as usize),
+        Some(_) => None, // -1 = all cores
+        None => Some(1),
+    };
+    if let Some(n) = n_threads {
+        builder = builder.num_threads(n);
+    }
+    builder.build().expect("failed to build rayon thread pool")
+}
+
 impl Default for RandomForest {
     fn default() -> Self {
         RandomForest::new(RandomForestParameters::default())
@@ -161,34 +173,18 @@ impl RandomForest {
 
     pub fn predict(&self, X: &ArrayView2<f64>) -> Array1<f64> {
         let mut predictions = Array1::<f64>::zeros(X.nrows());
+        let mut scratch = Array1::<f64>::zeros(X.nrows());
 
         for tree in &self.trees {
-            predictions = predictions + tree.predict(X);
+            tree.predict_into(X, &mut scratch);
+            predictions += &scratch;
         }
 
         predictions / self.trees.len() as f64
     }
 
     pub fn fit(&mut self, X: &ArrayView2<f64>, y: &ArrayView1<f64>) {
-        let mut thread_pool_builder = ThreadPoolBuilder::new();
-
-        // If n_jobs = 1 or None, use a single process. If n_jobs = -1, use all processes.
-        let n_jobs_usize = match self.random_forest_parameters.n_jobs {
-            Some(n_jobs) => {
-                if n_jobs >= 1 {
-                    Some(n_jobs as usize)
-                } else {
-                    None
-                }
-            }
-            None => Some(1),
-        };
-
-        if let Some(n_jobs) = n_jobs_usize {
-            thread_pool_builder = thread_pool_builder.num_threads(n_jobs);
-        }
-
-        let thread_pool = thread_pool_builder.build().unwrap();
+        let thread_pool = build_thread_pool(self.random_forest_parameters.n_jobs);
 
         let indices: Vec<usize> = (0..X.ncols()).collect();
         let indices: Vec<Vec<usize>> = thread_pool.install(|| {
@@ -234,26 +230,14 @@ impl RandomForest {
         })
     }
 
+    /// Fit the forest and return out-of-bag predictions for each training sample.
+    ///
+    /// Each element of the returned array is the average prediction of the trees
+    /// for which that sample was out-of-bag. Samples that were in-bag for every
+    /// estimator (i.e. never left out during bootstrap sampling) will have
+    /// `f64::NAN` as their OOB prediction.
     pub fn fit_predict_oob(&mut self, X: &ArrayView2<f64>, y: &ArrayView1<f64>) -> Array1<f64> {
-        let mut thread_pool_builder = ThreadPoolBuilder::new();
-
-        // If n_jobs = 1 or None, use a single process. If n_jobs = -1, use all processes.
-        let n_jobs_usize = match self.random_forest_parameters.n_jobs {
-            Some(n_jobs) => {
-                if n_jobs >= 1 {
-                    Some(n_jobs as usize)
-                } else {
-                    None
-                }
-            }
-            None => Some(1),
-        };
-
-        if let Some(n_jobs) = n_jobs_usize {
-            thread_pool_builder = thread_pool_builder.num_threads(n_jobs);
-        }
-
-        let thread_pool = thread_pool_builder.build().unwrap();
+        let thread_pool = build_thread_pool(self.random_forest_parameters.n_jobs);
 
         let indices: Vec<usize> = (0..X.ncols()).collect();
 
@@ -280,7 +264,7 @@ impl RandomForest {
                     let mut tree = DecisionTree::new(
                         tree_parameters
                             .clone()
-                            .with_random_state(rng.random::<u64>()),
+                            .with_random_state(seed),
                     );
 
                     let weights = sample_weights(X.nrows(), &mut rng);
@@ -312,6 +296,10 @@ impl RandomForest {
             }
         }
 
-        oob_predictions * oob_n_estimators.mapv(|x| 1. / x as f64)
+        Array1::from_iter(
+            oob_predictions.iter().zip(oob_n_estimators.iter()).map(|(&pred, &n)| {
+                if n == 0 { f64::NAN } else { pred / n as f64 }
+            })
+        )
     }
 }
