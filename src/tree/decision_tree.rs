@@ -128,6 +128,9 @@ mod tests {
 #[cfg(feature = "serde")]
 #[test]
 fn test_serialized_deserialized_tree_predicts_same_as_fit_tree() {
+    use crate::{MaxFeatures, testing::load_iris};
+    use ndarray::s;
+
     let data = load_iris();
     let X = data.slice(s![.., 0..4]);
     let y = data.slice(s![.., 4]);
