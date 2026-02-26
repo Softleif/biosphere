@@ -1,8 +1,6 @@
-# Information for Coding Agents
-
 Biosphere is a Rust library for fast and simple Random Forests.
 
-## Project Overview
+# Project Overview
 
 The repository consists of:
 - **Rust core library** (`src/`): Core random forest and decision tree implementation
@@ -55,11 +53,24 @@ The `MaxFeatures` enum supports multiple feature sampling strategies:
 - `Fraction(f64)`: Use fraction of features
 - `Sqrt`: Use sqrt(n_features)
 
-# Agent Instructions
+## GPU Feature (`--features gpu`)
+
+**What was built:**
+- `src/flat_forest.rs` — `FlatForest` / `FlatNode`: BFS-encoded flat tree array usable for both CPU and GPU inference. `FlatForest::from_forest(forest, n_features)` flattens all trees (padded to uniform `max_tree_size = 2^(max_depth+1) - 1`). `FlatForest::predict` matches `RandomForest::predict` exactly.
+- `src/gpu/pipeline.rs` — `GpuForest`: uploads `FlatForest` to GPU (f64→f32), compiles WGSL pipelines, runs batched inference via `predict(&[f32], n_samples) -> Vec<f32>`.
+- `src/gpu/shaders/traverse.wgsl` — 2D dispatch `(ceil(n_samples/64), n_trees, 1)`, one thread per (sample, tree).
+- `src/gpu/shaders/reduce.wgsl` — averages per-tree predictions per sample.
+- Tests: `tests/flat_forest.rs` (CPU, no feature flag), `tests/gpu_inference.rs` (requires GPU, `--features gpu`).
+
+## Known pre-existing issue
+
+The debug assertion in `decision_tree_node.rs:180` fires for random training sets > ~300 samples — keep test training sizes ≤ 200 samples.
+
+# Memory
 
 **Keep this file updated.** After every session where you discover something stable and non-obvious about this project, add it below. Remove or correct entries that turn out to be wrong or outdated. Do not duplicate entries already in CLAUDE.md.
 
-## Interactivity guidelines
+# Interactivity guidelines
 
 When you are asked to implement something, always ask for clarifications if needed.
 If you are unsure about the requirements, ask for more details.
