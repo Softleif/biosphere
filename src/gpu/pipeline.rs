@@ -46,6 +46,41 @@ struct GpuForestShared {
     n_features: u32,
 }
 
+/// A submitted GPU inference job awaiting results.
+///
+/// Created by [`GpuForest::predict_submit`]. Call [`PredictHandle::collect`] to
+/// wait for the GPU to finish and retrieve the predictions.
+///
+/// Submitting multiple handles before calling `collect` on any of them lets the
+/// GPU execute the underlying work concurrently.
+pub struct PredictHandle<'forest> {
+    forest: &'forest GpuForest,
+    submit_idx: wgpu::SubmissionIndex,
+    output_bytes: u64,
+}
+
+impl<'forest> PredictHandle<'forest> {
+    /// Block until the GPU finishes this submission and return the predictions.
+    ///
+    /// One `f32` per sample, in the same order as the input to [`GpuForest::predict_submit`].
+    pub fn collect(self) -> Vec<f32> {
+        let device = &self.forest.shared.device;
+        let buffer_slice = self.forest.staging_buffer.slice(..self.output_bytes);
+        buffer_slice.map_async(wgpu::MapMode::Read, |_| {});
+        device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(self.submit_idx),
+                timeout: Some(std::time::Duration::from_secs(10)),
+            })
+            .expect("GPU poll failed");
+        let data = buffer_slice.get_mapped_range();
+        let result = bytemuck::cast_slice::<u8, f32>(&data).to_vec();
+        drop(data);
+        self.forest.staging_buffer.unmap();
+        result
+    }
+}
+
 /// A random forest loaded onto the GPU for batched inference.
 ///
 /// Create with [`GpuForest::from_flat_forest`], then call [`GpuForest::predict`].
@@ -268,20 +303,22 @@ impl GpuForest {
         Self::alloc_buffers(Arc::clone(&self.shared), max_samples)
     }
 
-    /// Run batched inference on `n_samples` samples.
+    /// Submit a batch inference job to the GPU and return a handle to collect results later.
     ///
-    /// See [`GpuForest::predict_async`] for the async version that avoids
-    /// blocking the current thread.
+    /// The GPU begins work immediately. Call [`PredictHandle::collect`] on the returned handle
+    /// to wait for completion and retrieve predictions. Submitting multiple handles before
+    /// collecting any allows the GPU to execute the work concurrently.
+    ///
+    /// Returns `None` when `n_samples == 0`.
     ///
     /// `features` is a row-major f32 slice of shape `(n_samples, n_features)`.
-    /// Returns one f32 prediction per sample (mean of all tree predictions).
     ///
     /// # Panics
     ///
     /// Panics if `n_samples > max_samples` (the value passed to [`GpuForest::from_flat_forest`]).
-    pub fn predict(&self, features: &[f32], n_samples: usize) -> Vec<f32> {
+    pub fn predict_submit(&self, features: &[f32], n_samples: usize) -> Option<PredictHandle<'_>> {
         if n_samples == 0 {
-            return vec![];
+            return None;
         }
         assert!(
             n_samples <= self.max_samples,
@@ -299,11 +336,10 @@ impl GpuForest {
         let per_tree_bytes = (n_samples * n_trees * size_of::<f32>()) as u64;
         let output_bytes = (n_samples * size_of::<f32>()) as u64;
 
-        // Upload features into the pre-allocated buffer.
         queue.write_buffer(&self.feature_buffer, 0, bytemuck::cast_slice(features));
 
-        // Create bind groups with sub-range sizes so that arrayLength() in the
-        // shaders reflects the actual n_samples, not the full max_samples capacity.
+        // Sub-range bind groups so that arrayLength() in the shaders reflects
+        // the actual n_samples, not the full max_samples capacity.
         let traverse_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &shared.traverse_bgl,
@@ -358,7 +394,6 @@ impl GpuForest {
             ],
         });
 
-        // --- Encode and submit ---
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
@@ -393,23 +428,29 @@ impl GpuForest {
         );
         let submit_idx = queue.submit(Some(encoder.finish()));
 
-        // --- Read results ---
-        // Map only the used portion of the pre-allocated staging buffer.
-        let buffer_slice = self.staging_buffer.slice(..output_bytes);
-        buffer_slice.map_async(wgpu::MapMode::Read, |_| {});
-        // Wait for exactly our submission — safe even with a shared device/queue.
-        device
-            .poll(wgpu::PollType::Wait {
-                submission_index: Some(submit_idx),
-                timeout: Some(std::time::Duration::from_secs(10)),
-            })
-            .expect("GPU poll failed");
+        Some(PredictHandle {
+            forest: self,
+            submit_idx,
+            output_bytes,
+        })
+    }
 
-        let data = buffer_slice.get_mapped_range();
-        let result = bytemuck::cast_slice::<u8, f32>(&data).to_vec();
-        drop(data);
-        self.staging_buffer.unmap();
-        result
+    /// Run batched inference on `n_samples` samples, blocking until complete.
+    ///
+    /// Equivalent to `predict_submit(features, n_samples).map(|h| h.collect()).unwrap_or_default()`.
+    /// Use [`GpuForest::predict_submit`] with deferred [`PredictHandle::collect`] to overlap
+    /// GPU work across multiple forests.
+    ///
+    /// `features` is a row-major f32 slice of shape `(n_samples, n_features)`.
+    /// Returns one f32 prediction per sample (mean of all tree predictions).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n_samples > max_samples` (the value passed to [`GpuForest::from_flat_forest`]).
+    pub fn predict(&self, features: &[f32], n_samples: usize) -> Vec<f32> {
+        self.predict_submit(features, n_samples)
+            .map(|h| h.collect())
+            .unwrap_or_default()
     }
 }
 

@@ -73,4 +73,4 @@
 //! [`RandomForest::predict`]: crate::RandomForest::predict
 
 mod pipeline;
-pub use pipeline::GpuForest;
+pub use pipeline::{GpuForest, PredictHandle};
