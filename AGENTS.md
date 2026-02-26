@@ -8,8 +8,10 @@ The repository consists of:
 
 ## Development Commands
 
+Run tests with all features:
+
 ```bash
-cargo test --features serde
+cargo test --all-features
 ```
 
 *Note:** Add/update tests when APIs are added or changed.

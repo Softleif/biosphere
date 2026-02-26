@@ -5,6 +5,25 @@ use ndarray::{Array1, ArrayView1, ArrayView2};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
+/// A single decision tree for regression or binary classification.
+///
+/// Splits features greedily to minimise impurity. Useful on its own for
+/// interpretable models; most users will prefer [`RandomForest`], which
+/// ensembles many trees for lower variance.
+///
+/// ```rust
+/// use biosphere::{DecisionTree, DecisionTreeParameters};
+/// use ndarray::array;
+///
+/// let X = array![[0.0, 1.0], [1.0, 0.0]];
+/// let y = array![0.0, 1.0];
+///
+/// let mut tree = DecisionTree::new(DecisionTreeParameters::default());
+/// tree.fit_with_samples(&X.view(), &y.view(), &[0, 1]);
+/// let predictions = tree.predict(&X.view());
+/// ```
+///
+/// [`RandomForest`]: crate::RandomForest
 #[derive(Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct DecisionTree {
