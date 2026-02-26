@@ -36,17 +36,31 @@ impl FlatNode {
     }
 }
 
-/// A random forest stored as a flat array of nodes with explicit child indices.
+/// A [`RandomForest`] converted to a flat, contiguous array for fast inference.
 ///
-/// Each tree occupies a contiguous slice of `max_tree_size` nodes:
-/// `nodes[tree_idx * max_tree_size .. (tree_idx + 1) * max_tree_size]`.
+/// This is the bridge between a trained forest and GPU execution. Convert once
+/// with [`FlatForest::from_forest`], then either call [`FlatForest::predict`]
+/// for CPU inference or pass it to [`GpuForest::from_flat_forest`] to run on
+/// the GPU.
 ///
-/// Node 0 of each slice is the root. Internal nodes store explicit `left`/`right`
-/// indices (relative to the tree's slice start). Shorter trees are padded with
-/// dummy leaf nodes that are never reached during inference.
+/// ```rust
+/// use biosphere::{FlatForest, RandomForest, RandomForestParameters};
+/// use ndarray::array;
 ///
-/// This representation enables cache-friendly CPU inference and direct GPU upload
-/// without exponential memory blowup for deep, sparse trees.
+/// let X = array![[0.0, 1.0], [1.0, 0.0]];
+/// let y = array![0.0, 1.0];
+/// let mut forest = RandomForest::new(RandomForestParameters::default());
+/// forest.fit(&X.view(), &y.view());
+///
+/// let flat = FlatForest::from_forest(&forest, X.ncols());
+/// let predictions = flat.predict(&X.view()); // identical to forest.predict()
+/// ```
+///
+/// Internally, each tree is stored in BFS order with explicit child indices so
+/// deep, sparse trees (common in practice) don't require exponential padding.
+///
+/// [`GpuForest::from_flat_forest`]: crate::gpu::GpuForest::from_flat_forest
+/// [`RandomForest`]: crate::RandomForest
 #[derive(Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct FlatForest {

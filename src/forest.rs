@@ -9,6 +9,21 @@ use rand::rngs::StdRng;
 use rayon::ThreadPoolBuilder;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
+/// Configuration for a [`RandomForest`].
+///
+/// Use the builder methods to customise the forest. Most users only need to
+/// change `n_estimators` and `seed`; all other parameters have sensible defaults.
+///
+/// ```rust
+/// use biosphere::{RandomForestParameters, MaxFeatures};
+///
+/// let params = RandomForestParameters::default()
+///     .with_n_estimators(200)
+///     .with_seed(42)
+///     .with_max_depth(Some(10))
+///     .with_max_features(MaxFeatures::Sqrt)
+///     .with_n_jobs(Some(-1)); // use all CPU cores for training
+/// ```
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct RandomForestParameters {
@@ -97,6 +112,28 @@ impl RandomForestParameters {
     }
 }
 
+/// A random forest ensemble for regression or binary classification.
+///
+/// Trains many [`DecisionTree`]s on bootstrap samples of your data and averages
+/// their predictions. More trees reduce variance at diminishing returns; 100–500
+/// is usually enough.
+///
+/// ```rust
+/// use biosphere::{RandomForest, RandomForestParameters};
+/// use ndarray::array;
+///
+/// let X = array![[0.0, 1.0], [1.0, 0.0]];
+/// let y = array![0.0, 1.0];
+///
+/// let mut forest = RandomForest::new(RandomForestParameters::default());
+/// forest.fit(&X.view(), &y.view());
+///
+/// let predictions = forest.predict(&X.view()); // Array1<f64>, one value per row
+/// ```
+///
+/// For GPU inference, convert to a [`FlatForest`] first.
+///
+/// [`FlatForest`]: crate::FlatForest
 #[derive(Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct RandomForest {

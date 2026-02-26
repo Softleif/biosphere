@@ -275,7 +275,7 @@ impl GpuForest {
     ///
     /// # Panics
     ///
-    /// Panics if `n_samples > max_samples` (the value passed to [`from_flat_forest`]).
+    /// Panics if `n_samples > max_samples` (the value passed to [`GpuForest::from_flat_forest`]).
     pub fn predict(&self, features: &[f32], n_samples: usize) -> Vec<f32> {
         if n_samples == 0 {
             return vec![];
@@ -384,7 +384,13 @@ impl GpuForest {
             cpass.dispatch_workgroups(x_groups, 1, 1);
         }
 
-        encoder.copy_buffer_to_buffer(&self.output_buffer, 0, &self.staging_buffer, 0, output_bytes);
+        encoder.copy_buffer_to_buffer(
+            &self.output_buffer,
+            0,
+            &self.staging_buffer,
+            0,
+            output_bytes,
+        );
         let submit_idx = queue.submit(Some(encoder.finish()));
 
         // --- Read results ---
