@@ -1,17 +1,26 @@
 use crate::forest::RandomForest;
 use crate::tree::DecisionTreeNode;
 use ndarray::{Array1, ArrayView2};
+use std::collections::VecDeque;
 
-/// A single node in a BFS-ordered flat tree.
+/// A single node in a flat tree stored in BFS visit order.
 ///
-/// Internal nodes use `feature_index` and `threshold`; leaf nodes use `leaf_value`.
-/// The BFS layout: node at index `i` has left child at `2i + 1`, right child at `2i + 2`.
-#[derive(Clone, Debug)]
+/// Internal nodes use `feature_index`, `threshold`, `left`, and `right`.
+/// Leaf nodes use `leaf_value`; `left` and `right` are -1.
+///
+/// Child indices are explicit offsets into the per-tree node slice, so trees
+/// of any shape can be stored without exponential padding.
+#[derive(Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct FlatNode {
     pub feature_index: u32,
     pub is_leaf: bool,
     pub threshold: f64,
     pub leaf_value: f64,
+    /// Index of the left child within the tree's node slice, or -1 for leaves.
+    pub left: i32,
+    /// Index of the right child within the tree's node slice, or -1 for leaves.
+    pub right: i32,
 }
 
 impl FlatNode {
@@ -21,17 +30,25 @@ impl FlatNode {
             is_leaf: true,
             threshold: 0.0,
             leaf_value: 0.0,
+            left: -1,
+            right: -1,
         }
     }
 }
 
-/// A random forest stored as a flat BFS-ordered array of nodes.
+/// A random forest stored as a flat array of nodes with explicit child indices.
 ///
-/// All trees are padded to `max_tree_size` nodes so any tree can be indexed as
-/// `nodes[tree_idx * max_tree_size + node_idx]`.
+/// Each tree occupies a contiguous slice of `max_tree_size` nodes:
+/// `nodes[tree_idx * max_tree_size .. (tree_idx + 1) * max_tree_size]`.
 ///
-/// This representation enables both cache-friendly CPU inference and direct GPU upload.
-#[derive(Clone, Debug)]
+/// Node 0 of each slice is the root. Internal nodes store explicit `left`/`right`
+/// indices (relative to the tree's slice start). Shorter trees are padded with
+/// dummy leaf nodes that are never reached during inference.
+///
+/// This representation enables cache-friendly CPU inference and direct GPU upload
+/// without exponential memory blowup for deep, sparse trees.
+#[derive(Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct FlatForest {
     /// Flat node array: length = `n_trees * max_tree_size`.
     pub nodes: Vec<FlatNode>,
@@ -39,7 +56,7 @@ pub struct FlatForest {
     pub n_features: usize,
     /// Nodes per tree (all trees padded to this size).
     pub max_tree_size: usize,
-    /// Maximum depth across all trees.
+    /// Maximum depth across all trees (used as a GPU traversal bound).
     pub max_depth: usize,
 }
 
@@ -52,21 +69,24 @@ impl FlatForest {
         let n_trees = trees.len();
         assert!(n_trees > 0, "Forest must have at least one tree");
 
-        // Compute the max depth across all trees.
         let max_depth = trees
             .iter()
             .map(|t| node_depth(t.root()))
             .max()
             .unwrap_or(0);
 
-        // BFS-complete tree needs 2^(depth+1) - 1 nodes.
-        let max_tree_size = (1usize << (max_depth + 1)).saturating_sub(1);
+        // Allocate only as many slots as the largest tree actually needs.
+        let max_tree_size = trees
+            .iter()
+            .map(|t| count_nodes(t.root()))
+            .max()
+            .unwrap_or(1);
 
         let mut nodes = vec![FlatNode::dummy_leaf(); n_trees * max_tree_size];
 
         for (tree_idx, tree) in trees.iter().enumerate() {
             let offset = tree_idx * max_tree_size;
-            fill_bfs(tree.root(), &mut nodes[offset..offset + max_tree_size], 0);
+            fill_bfs(tree.root(), &mut nodes[offset..offset + max_tree_size]);
         }
 
         FlatForest {
@@ -108,15 +128,15 @@ impl FlatForest {
                 return node.leaf_value;
             }
             if features[node.feature_index as usize] < node.threshold {
-                idx = 2 * idx + 1; // left
+                idx = node.left as usize;
             } else {
-                idx = 2 * idx + 2; // right
+                idx = node.right as usize;
             }
         }
     }
 }
 
-/// Recursively compute the depth of a node (0 = leaf, 1 = one level of splits, …).
+/// Recursively compute the depth of a node (0 = leaf, 1 = one split level, …).
 fn node_depth(node: &DecisionTreeNode) -> usize {
     if node.feature_index.is_none() {
         0
@@ -126,26 +146,50 @@ fn node_depth(node: &DecisionTreeNode) -> usize {
     }
 }
 
-/// Fill BFS-ordered `nodes` slice starting at `index` by recursively visiting `node`.
-fn fill_bfs(node: &DecisionTreeNode, nodes: &mut [FlatNode], index: usize) {
-    if index >= nodes.len() {
-        return;
-    }
+/// Count the total number of nodes in the subtree rooted at `node`.
+fn count_nodes(node: &DecisionTreeNode) -> usize {
     if node.feature_index.is_none() {
-        nodes[index] = FlatNode {
-            feature_index: 0,
-            is_leaf: true,
-            threshold: 0.0,
-            leaf_value: node.label.unwrap(),
-        };
+        1
     } else {
-        nodes[index] = FlatNode {
-            feature_index: node.feature_index.unwrap() as u32,
-            is_leaf: false,
-            threshold: node.feature_value.unwrap(),
-            leaf_value: 0.0,
-        };
-        fill_bfs(node.left_child.as_ref().unwrap(), nodes, 2 * index + 1);
-        fill_bfs(node.right_child.as_ref().unwrap(), nodes, 2 * index + 2);
+        1 + count_nodes(node.left_child.as_ref().unwrap())
+            + count_nodes(node.right_child.as_ref().unwrap())
+    }
+}
+
+/// Fill `nodes` with the tree rooted at `root` in BFS order, storing explicit
+/// child indices in each internal node.
+fn fill_bfs(root: &DecisionTreeNode, nodes: &mut [FlatNode]) {
+    let mut queue: VecDeque<(&DecisionTreeNode, usize)> = VecDeque::new();
+    queue.push_back((root, 0));
+    let mut next_slot = 1usize;
+
+    while let Some((node, idx)) = queue.pop_front() {
+        if node.feature_index.is_none() {
+            nodes[idx] = FlatNode {
+                feature_index: 0,
+                is_leaf: true,
+                threshold: 0.0,
+                leaf_value: node.label.unwrap(),
+                left: -1,
+                right: -1,
+            };
+        } else {
+            let left_idx = next_slot;
+            next_slot += 1;
+            let right_idx = next_slot;
+            next_slot += 1;
+
+            nodes[idx] = FlatNode {
+                feature_index: node.feature_index.unwrap() as u32,
+                is_leaf: false,
+                threshold: node.feature_value.unwrap(),
+                leaf_value: 0.0,
+                left: left_idx as i32,
+                right: right_idx as i32,
+            };
+
+            queue.push_back((node.left_child.as_ref().unwrap(), left_idx));
+            queue.push_back((node.right_child.as_ref().unwrap(), right_idx));
+        }
     }
 }

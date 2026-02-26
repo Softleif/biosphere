@@ -56,11 +56,14 @@ The `MaxFeatures` enum supports multiple feature sampling strategies:
 ## GPU Feature (`--features gpu`)
 
 **What was built:**
-- `src/flat_forest.rs` — `FlatForest` / `FlatNode`: BFS-encoded flat tree array usable for both CPU and GPU inference. `FlatForest::from_forest(forest, n_features)` flattens all trees (padded to uniform `max_tree_size = 2^(max_depth+1) - 1`). `FlatForest::predict` matches `RandomForest::predict` exactly.
+- `src/flat_forest.rs` — `FlatForest` / `FlatNode`: flat tree array usable for both CPU and GPU inference. Nodes are stored in BFS visit order with **explicit child indices** (`left: i32`, `right: i32`; -1 for leaves). `max_tree_size` is the actual maximum node count across trees (NOT `2^(max_depth+1) - 1`). `FlatForest::from_forest(forest, n_features)` flattens all trees; `FlatForest::predict` matches `RandomForest::predict` exactly.
 - `src/gpu/pipeline.rs` — `GpuForest`: uploads `FlatForest` to GPU (f64→f32), compiles WGSL pipelines, runs batched inference via `predict(&[f32], n_samples) -> Vec<f32>`.
-- `src/gpu/shaders/traverse.wgsl` — 2D dispatch `(ceil(n_samples/64), n_trees, 1)`, one thread per (sample, tree).
+- `src/gpu/shaders/traverse.wgsl` — 2D dispatch `(ceil(n_samples/64), n_trees, 1)`, one thread per (sample, tree). Uses `u32(node.left)` / `u32(node.right)` for traversal; `max_depth` is kept as a GPU loop safety bound only.
 - `src/gpu/shaders/reduce.wgsl` — averages per-tree predictions per sample.
 - Tests: `tests/flat_forest.rs` (CPU, no feature flag), `tests/gpu_inference.rs` (requires GPU, `--features gpu`).
+
+**Why not BFS positional encoding (`2i+1`/`2i+2`):**
+Real-world RF trees trained without a `max_depth` constraint are deep and sparse. A positional BFS layout requires `2^(depth+1) - 1` slots per tree — depth ~44 means petabytes of allocation. Explicit child indices allocate only actual nodes.
 
 ## Known pre-existing issue
 

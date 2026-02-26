@@ -1,7 +1,7 @@
 use crate::flat_forest::FlatForest;
 use wgpu::util::DeviceExt;
 
-/// GPU representation of a single node (f32, 16 bytes, bytemuck-compatible).
+/// GPU representation of a single node (f32/i32, 24 bytes, bytemuck-compatible).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct GpuNode {
@@ -9,6 +9,10 @@ struct GpuNode {
     is_leaf: u32,
     threshold: f32,
     leaf_value: f32,
+    /// Left child index within the tree's node slice, or -1 for leaves.
+    left: i32,
+    /// Right child index within the tree's node slice, or -1 for leaves.
+    right: i32,
 }
 
 /// Forest metadata passed to every shader invocation.
@@ -74,6 +78,8 @@ impl GpuForest {
                 is_leaf: n.is_leaf as u32,
                 threshold: n.threshold as f32,
                 leaf_value: n.leaf_value as f32,
+                left: n.left,
+                right: n.right,
             })
             .collect();
 
