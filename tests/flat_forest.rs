@@ -69,7 +69,7 @@ fn flat_forest_single_sample() {
 
 #[test]
 fn flat_forest_deep_tree() {
-    // Trees trained with no max_depth can grow very deep — verify BFS padding is correct.
+    // Trees trained with no max_depth can grow very deep — verify explicit-index layout is correct.
     let (X, y) = make_data(150, 8, 123);
 
     let params = RandomForestParameters::default()
