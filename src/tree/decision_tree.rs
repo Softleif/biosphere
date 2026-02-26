@@ -93,6 +93,10 @@ impl DecisionTree {
         let samples: Vec<usize> = (0..X.nrows()).collect();
         self.fit_with_samples(X, y, &samples);
     }
+
+    pub(crate) fn root(&self) -> &DecisionTreeNode {
+        &self.node
+    }
 }
 
 #[cfg(test)]
