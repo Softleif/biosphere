@@ -274,30 +274,3 @@ impl RandomForest {
         oob_predictions * oob_n_estimators.mapv(|x| 1. / x as f64)
     }
 }
-
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//     use crate::testing::load_iris;
-//     use ndarray::s;
-
-//     #[test]
-//     fn test_random_forest_predict() {
-//         let data = load_iris();
-//         let X = data.slice(s![0..100, 0..4]);
-//         let y = data.slice(s![0..100, 4]);
-
-//         let random_forest_parameters = RandomForestParameters::default();
-//         let forest = RandomForest::new(&X, &y, random_forest_parameters);
-
-//         let predictions = forest.predict();
-//         let mse = (&predictions - &y).mapv(|x| x * x).sum();
-//         assert!(
-//             mse < 0.1,
-//             "mse {} \ny={:?}\npredictions={:?}",
-//             mse,
-//             y,
-//             predictions
-//         );
-//     }
-// }
