@@ -5,6 +5,7 @@ use ndarray::{Array1, ArrayView1, ArrayView2};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
+#[derive(Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct DecisionTree {
     decision_tree_parameters: DecisionTreeParameters,
