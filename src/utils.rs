@@ -5,7 +5,7 @@ use rand::Rng;
 ///
 /// Parameters
 /// ----------
-/// data: Array1<f64> or ArrayView1<f64>
+/// data: `Array1<f64>` or `ArrayView1<f64>`
 pub fn argsort(data: &ArrayBase<impl Data<Elem = f64>, Ix1>) -> Vec<usize> {
     let mut indices = (0..data.len()).collect::<Vec<usize>>();
     indices.sort_unstable_by(|a, b| data[*a].partial_cmp(&data[*b]).unwrap());

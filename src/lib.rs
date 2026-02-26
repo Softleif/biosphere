@@ -9,5 +9,8 @@ mod forest;
 mod tree;
 pub mod utils; // This is public for benchmarking only.
 
+#[cfg(feature = "gpu")]
+pub mod gpu;
+
 #[cfg(test)]
 mod testing;
