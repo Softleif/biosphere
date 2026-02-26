@@ -56,3 +56,8 @@ harness = false
 name = "bench_tree_serde"
 harness = false
 required-features = ["serde"]
+
+[[bench]]
+name = "bench_gpu"
+harness = false
+required-features = ["gpu"]
