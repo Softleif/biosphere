@@ -118,6 +118,10 @@ impl RandomForest {
         }
     }
 
+    pub(crate) fn trees(&self) -> &[DecisionTree] {
+        &self.trees
+    }
+
     pub fn predict(&self, X: &ArrayView2<f64>) -> Array1<f64> {
         let mut predictions = Array1::<f64>::zeros(X.nrows());
 
