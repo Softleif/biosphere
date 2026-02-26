@@ -1,11 +1,11 @@
 use biosphere::{DecisionTree, DecisionTreeParameters, MaxFeatures};
 
 #[cfg(test)]
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use ndarray::{Array1, Array2};
-use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 use std::hint::black_box;
 
 #[allow(non_snake_case)]

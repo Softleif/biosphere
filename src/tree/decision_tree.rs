@@ -1,9 +1,9 @@
-use crate::tree::decision_tree_node::DecisionTreeNode;
 use crate::tree::DecisionTreeParameters;
+use crate::tree::decision_tree_node::DecisionTreeNode;
 use crate::utils::sorted_samples;
 use ndarray::{Array1, ArrayView1, ArrayView2};
-use rand::rngs::StdRng;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 
 #[derive(Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]

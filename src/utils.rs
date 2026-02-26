@@ -67,10 +67,10 @@ mod tests {
     use super::*;
     use crate::testing::is_sorted;
     use ndarray::{Array, Axis};
-    use ndarray_rand::rand_distr::Uniform;
     use ndarray_rand::RandomExt;
-    use rand::rngs::StdRng;
+    use ndarray_rand::rand_distr::Uniform;
     use rand::SeedableRng;
+    use rand::rngs::StdRng;
 
     #[test]
     fn test_argsort() {
