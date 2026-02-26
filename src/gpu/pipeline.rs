@@ -283,22 +283,6 @@ impl GpuForest {
         if n_samples == 0 {
             return vec![];
         }
-        pollster::block_on(self.predict_async(features, n_samples))
-    }
-
-    /// Async batched inference on `n_samples` samples. Use this if you need to
-    /// await other async work between GPU submission and result retrieval.
-    ///
-    /// `features` is a row-major f32 slice of shape `(n_samples, n_features)`.
-    /// Returns one f32 prediction per sample (mean of all tree predictions).
-    ///
-    /// # Panics
-    ///
-    /// Panics if `n_samples > max_samples` (the value passed to [`from_flat_forest`]).
-    pub async fn predict_async(&self, features: &[f32], n_samples: usize) -> Vec<f32> {
-        if n_samples == 0 {
-            return vec![];
-        }
         assert!(
             n_samples <= self.max_samples,
             "n_samples={n_samples} exceeds max_samples={}",
@@ -417,7 +401,7 @@ impl GpuForest {
         device
             .poll(wgpu::PollType::Wait {
                 submission_index: Some(submit_idx),
-                timeout: None,
+                timeout: Some(std::time::Duration::from_secs(10)),
             })
             .expect("GPU poll failed");
 
