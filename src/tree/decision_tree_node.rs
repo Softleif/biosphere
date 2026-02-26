@@ -1,7 +1,7 @@
 use crate::tree::DecisionTreeParameters;
 use ndarray::{ArrayView1, ArrayView2};
-use rand::seq::SliceRandom;
 use rand::Rng;
+use rand::seq::SliceRandom;
 use std::debug_assert;
 
 static MIN_GAIN_TO_SPLIT: f64 = 1e-12;
@@ -38,9 +38,10 @@ impl DecisionTreeNode {
         parameters: &DecisionTreeParameters,
     ) {
         if let Some(depth) = parameters.max_depth
-            && current_depth >= depth {
-                return self.leaf_node(sum / n_samples as f64);
-            }
+            && current_depth >= depth
+        {
+            return self.leaf_node(sum / n_samples as f64);
+        }
 
         if n_samples <= parameters.min_samples_split {
             return self.leaf_node(sum / n_samples as f64);
@@ -330,11 +331,11 @@ mod tests {
     use crate::testing::is_sorted;
     use crate::utils::sorted_samples;
     use assert_approx_eq::*;
-    use ndarray::{arr1, arr2, s, Array, Array1, Axis};
-    use ndarray_rand::rand_distr::Uniform;
+    use ndarray::{Array, Array1, Axis, arr1, arr2, s};
     use ndarray_rand::RandomExt;
-    use rand::rngs::StdRng;
+    use ndarray_rand::rand_distr::Uniform;
     use rand::SeedableRng;
+    use rand::rngs::StdRng;
     use rstest::*;
 
     #[rstest]

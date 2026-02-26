@@ -3,11 +3,11 @@ use crate::utils::{
     argsort, oob_samples_from_weights, sample_indices_from_weights, sample_weights,
 };
 use ndarray::{Array1, ArrayView1, ArrayView2};
-use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use rand::rngs::StdRng;
 use rayon::ThreadPoolBuilder;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
