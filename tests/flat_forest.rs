@@ -34,7 +34,8 @@ fn flat_forest_matches_recursive() {
     let cpu_preds = forest.predict(&test_X.view());
 
     let flat = FlatForest::from_forest(&forest, 10);
-    let flat_preds = flat.predict(&test_X.view());
+    let test_X_f32 = test_X.mapv(|v| v as f32);
+    let flat_preds = flat.predict(&test_X_f32.view());
 
     for (i, (cpu, flat)) in cpu_preds.iter().zip(flat_preds.iter()).enumerate() {
         // FlatForest stores nodes as f32; allow for f32 quantisation error.
@@ -58,7 +59,8 @@ fn flat_forest_single_sample() {
     let (test_X, _) = make_data(1, 5, 55);
     let cpu_preds = forest.predict(&test_X.view());
     let flat = FlatForest::from_forest(&forest, 5);
-    let flat_preds = flat.predict(&test_X.view());
+    let test_X_f32 = test_X.mapv(|v| v as f32);
+    let flat_preds = flat.predict(&test_X_f32.view());
 
     // FlatForest stores nodes as f32; allow for f32 quantisation error.
     assert!(
@@ -83,7 +85,8 @@ fn flat_forest_deep_tree() {
     let (test_X, _) = make_data(50, 8, 456);
     let cpu_preds = forest.predict(&test_X.view());
     let flat = FlatForest::from_forest(&forest, 8);
-    let flat_preds = flat.predict(&test_X.view());
+    let test_X_f32 = test_X.mapv(|v| v as f32);
+    let flat_preds = flat.predict(&test_X_f32.view());
 
     for (i, (cpu, flat)) in cpu_preds.iter().zip(flat_preds.iter()).enumerate() {
         // FlatForest stores nodes as f32; allow for f32 quantisation error.

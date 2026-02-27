@@ -63,7 +63,7 @@ fn benchmark_predict(c: &mut Criterion) {
         });
 
         group.bench_with_input(BenchmarkId::new("FlatForest", n), &n, |b, _| {
-            b.iter(|| flat.predict(&X_infer.view()))
+            b.iter(|| flat.predict(&X_f32.view()))
         });
 
         group.bench_with_input(BenchmarkId::new("GpuForest", n), &n, |b, _| {

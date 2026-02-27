@@ -79,16 +79,17 @@ impl FlatNode {
 /// forest.fit(&X.view(), &y.view());
 ///
 /// let flat = FlatForest::from_forest(&forest, X.ncols());
-/// let predictions = flat.predict(&X.view()); // comparable to forest.predict()
+/// let X_f32 = X.mapv(|v| v as f32);
+/// let predictions = flat.predict(&X_f32.view()); // comparable to forest.predict()
 /// ```
 ///
 /// Internally, each tree is stored in BFS order with explicit child indices so
 /// deep, sparse trees (common in practice) don't require exponential padding.
 ///
-/// All thresholds and leaf values are stored as `f32`. CPU inference casts
-/// feature values to `f32` before comparison so that split decisions are
-/// identical to GPU inference. Results are accumulated in `f64` and returned
-/// as `f64` for API consistency with [`RandomForest::predict`].
+/// All thresholds and leaf values are stored as `f32`. Features must be passed
+/// as `f32` so that split decisions are identical to GPU inference. Results are
+/// accumulated in `f64` and returned as `f64` for API consistency with
+/// [`RandomForest::predict`].
 ///
 /// [`GpuForest::from_flat_forest`]: crate::gpu::GpuForest::from_flat_forest
 /// [`RandomForest`]: crate::RandomForest
@@ -149,14 +150,14 @@ impl FlatForest {
 
     /// Run inference on a batch of samples.
     ///
-    /// Feature values are cast to `f32` internally so that split decisions are
-    /// identical to GPU inference. The per-tree leaf values (f32) are accumulated
-    /// in f64 and the final mean is returned as `Array1<f64>`.
+    /// Features must be `f32` to match the precision of stored thresholds and
+    /// GPU inference. The per-tree leaf values (f32) are accumulated in f64 and
+    /// the final mean is returned as `Array1<f64>`.
     ///
     /// The loop order is outer=tree, inner=sample so that each tree's node array
     /// stays warm in L3 cache while all samples are processed against it, rather
     /// than re-loading every tree's nodes for every sample.
-    pub fn predict(&self, X: &ArrayView2<f64>) -> Array1<f64> {
+    pub fn predict(&self, X: &ArrayView2<f32>) -> Array1<f64> {
         let n_samples = X.nrows();
         let mut output = Array1::<f64>::zeros(n_samples);
 
@@ -171,7 +172,7 @@ impl FlatForest {
         output / self.meta.n_trees as f64
     }
 
-    fn predict_one(&self, tree_idx: usize, features: &[f64]) -> f64 {
+    fn predict_one(&self, tree_idx: usize, features: &[f32]) -> f64 {
         let offset = tree_idx * self.meta.max_tree_size as usize;
         let mut idx = 0usize;
         for _ in 0..self.meta.max_tree_size as usize {

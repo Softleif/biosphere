@@ -41,10 +41,10 @@ mod gpu_tests {
 
         let (test_x, _) = make_data(100, n_features, 99);
         let flat = FlatForest::from_forest(&forest, n_features);
-        let cpu_preds = flat.predict(&test_x.view());
+        let test_x_f32 = test_x.mapv(|v| v as f32);
+        let cpu_preds = flat.predict(&test_x_f32.view());
 
         let gpu_forest = GpuForest::from_flat_forest(&flat, 100);
-        let test_x_f32 = test_x.mapv(|v| v as f32);
         let gpu_preds = gpu_forest.predict(&test_x_f32.view());
 
         // Both FlatForest and GpuForest use f32 nodes and f32 comparisons.
@@ -71,10 +71,10 @@ mod gpu_tests {
 
         let (test_x, _) = make_data(1, n_features, 55);
         let flat = FlatForest::from_forest(&forest, n_features);
-        let cpu_preds = flat.predict(&test_x.view());
+        let test_x_f32 = test_x.mapv(|v| v as f32);
+        let cpu_preds = flat.predict(&test_x_f32.view());
 
         let gpu_forest = GpuForest::from_flat_forest(&flat, 1);
-        let test_x_f32 = test_x.mapv(|v| v as f32);
         let gpu_preds = gpu_forest.predict(&test_x_f32.view());
 
         assert!(
