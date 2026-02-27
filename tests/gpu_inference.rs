@@ -111,7 +111,11 @@ mod gpu_tests {
             let cpu_preds = flat.predict(&test_x_f32.view());
             let gpu_preds = gpu_forest.predict(&test_x_f32.view());
 
-            assert_eq!(gpu_preds.len(), n_samples, "n_samples={n_samples}: output length mismatch");
+            assert_eq!(
+                gpu_preds.len(),
+                n_samples,
+                "n_samples={n_samples}: output length mismatch"
+            );
             for (i, (cpu, gpu)) in cpu_preds.iter().zip(gpu_preds.iter()).enumerate() {
                 assert!(
                     ((*cpu as f32) - gpu).abs() < 1e-5,
@@ -187,6 +191,214 @@ mod gpu_tests {
             assert!(
                 ((*cpu as f32) - gpu).abs() < 1e-5,
                 "sample {i}: cpu={cpu}, gpu={gpu}"
+            );
+        }
+    }
+
+    // --- is_uma() ---
+    /// is_uma() must be callable and return a bool without panicking.
+    /// Its value depends on the adapter type (true on Apple Silicon, false on discrete GPUs).
+    #[test]
+    fn gpu_is_uma_returns_bool() {
+        let n_features = 4;
+        let (train_x, train_y) = make_data(50, n_features, 1);
+        let params = RandomForestParameters::default()
+            .with_n_estimators(5)
+            .with_seed(1);
+        let mut forest = RandomForest::new(params);
+        forest.fit(&train_x.view(), &train_y.view());
+
+        let flat = FlatForest::from_forest(&forest, n_features);
+        let gpu_forest = GpuForest::from_flat_forest(&flat, 10);
+
+        // Just ensure it's callable; the value is adapter-dependent.
+        let _uma: bool = gpu_forest.is_uma();
+    }
+
+    // --- with_collect_timeout ---
+    /// Configuring a generous timeout must not break normal inference.
+    #[test]
+    fn gpu_with_collect_timeout_works() {
+        let n_features = 4;
+        let (train_x, train_y) = make_data(100, n_features, 2);
+        let params = RandomForestParameters::default()
+            .with_n_estimators(10)
+            .with_seed(2);
+        let mut forest = RandomForest::new(params);
+        forest.fit(&train_x.view(), &train_y.view());
+
+        let flat = FlatForest::from_forest(&forest, n_features);
+        let gpu_forest = GpuForest::from_flat_forest(&flat, 50)
+            .with_collect_timeout(std::time::Duration::from_secs(60));
+
+        let (test_x, _) = make_data(30, n_features, 99);
+        let test_x_f32 = test_x.mapv(|v| v as f32);
+
+        let cpu_preds = flat.predict(&test_x_f32.view());
+        let gpu_preds = gpu_forest.predict(&test_x_f32.view());
+
+        for (i, (cpu, gpu)) in cpu_preds.iter().zip(gpu_preds.iter()).enumerate() {
+            assert!(
+                ((*cpu as f32) - gpu).abs() < 1e-5,
+                "sample {i}: cpu={cpu}, gpu={gpu}"
+            );
+        }
+    }
+
+    // --- Busy flag: double predict_submit panics ---
+    /// Calling predict_submit twice without an intervening collect must panic.
+    #[test]
+    #[should_panic(expected = "outstanding PredictHandle")]
+    fn gpu_double_predict_submit_panics() {
+        let n_features = 4;
+        let (train_x, train_y) = make_data(50, n_features, 3);
+        let params = RandomForestParameters::default()
+            .with_n_estimators(5)
+            .with_seed(3);
+        let mut forest = RandomForest::new(params);
+        forest.fit(&train_x.view(), &train_y.view());
+
+        let flat = FlatForest::from_forest(&forest, n_features);
+        let gpu_forest = GpuForest::from_flat_forest(&flat, 20);
+
+        let (test_x, _) = make_data(10, n_features, 50);
+        let test_x_f32 = test_x.mapv(|v| v as f32);
+
+        let _handle = gpu_forest.predict_submit(&test_x_f32.view()).unwrap();
+        // Second submit without collecting _handle — should panic.
+        gpu_forest.predict_submit(&test_x_f32.view());
+    }
+
+    // --- Test #10: GpuForest::fork ---
+    /// A forked handle shares pipelines and node data with the original but has
+    /// independent buffers. Both must produce identical predictions.
+    #[test]
+    fn gpu_fork_matches_original() {
+        let n_features = 5;
+        let (train_x, train_y) = make_data(150, n_features, 42);
+        let params = RandomForestParameters::default()
+            .with_n_estimators(10)
+            .with_seed(10);
+        let mut forest = RandomForest::new(params);
+        forest.fit(&train_x.view(), &train_y.view());
+
+        let flat = FlatForest::from_forest(&forest, n_features);
+        let gpu_forest = GpuForest::from_flat_forest(&flat, 100);
+        let forked = gpu_forest.fork(100);
+
+        let (test_x, _) = make_data(50, n_features, 99);
+        let test_x_f32 = test_x.mapv(|v| v as f32);
+
+        let preds_orig = gpu_forest.predict(&test_x_f32.view());
+        let preds_fork = forked.predict(&test_x_f32.view());
+
+        assert_eq!(preds_orig.len(), preds_fork.len());
+        for (i, (p1, p2)) in preds_orig.iter().zip(preds_fork.iter()).enumerate() {
+            assert_eq!(p1, p2, "sample {i}: original={p1}, fork={p2}");
+        }
+    }
+
+    // --- Test #12: n_samples > max_samples panics ---
+    /// predict_submit must panic when the batch exceeds the pre-allocated capacity.
+    #[test]
+    #[should_panic(expected = "exceeds max_samples")]
+    fn gpu_exceeds_max_samples_panics() {
+        let n_features = 4;
+        let (train_x, train_y) = make_data(100, n_features, 42);
+        let params = RandomForestParameters::default()
+            .with_n_estimators(5)
+            .with_seed(12);
+        let mut forest = RandomForest::new(params);
+        forest.fit(&train_x.view(), &train_y.view());
+
+        let flat = FlatForest::from_forest(&forest, n_features);
+        let gpu_forest = GpuForest::from_flat_forest(&flat, 10); // max_samples=10
+
+        let (test_x, _) = make_data(20, n_features, 99); // 20 > 10
+        let test_x_f32 = test_x.mapv(|v| v as f32);
+        gpu_forest.predict(&test_x_f32.view()); // should panic
+    }
+
+    // --- Test #13: GPU predictions are deterministic across calls ---
+    /// Three consecutive predict calls on the same GpuForest must return bit-for-bit
+    /// identical results. Guards against non-determinism in the reduce pass.
+    #[test]
+    fn gpu_deterministic_across_calls() {
+        let n_features = 5;
+        let (train_x, train_y) = make_data(100, n_features, 42);
+        let params = RandomForestParameters::default()
+            .with_n_estimators(10)
+            .with_seed(13);
+        let mut forest = RandomForest::new(params);
+        forest.fit(&train_x.view(), &train_y.view());
+
+        let flat = FlatForest::from_forest(&forest, n_features);
+        let gpu_forest = GpuForest::from_flat_forest(&flat, 50);
+
+        let (test_x, _) = make_data(30, n_features, 99);
+        let test_x_f32 = test_x.mapv(|v| v as f32);
+
+        let preds1 = gpu_forest.predict(&test_x_f32.view());
+        let preds2 = gpu_forest.predict(&test_x_f32.view());
+        let preds3 = gpu_forest.predict(&test_x_f32.view());
+
+        for i in 0..preds1.len() {
+            assert_eq!(preds1[i], preds2[i], "run 1 vs 2, sample {i}");
+            assert_eq!(preds1[i], preds3[i], "run 1 vs 3, sample {i}");
+        }
+    }
+
+    // --- Test #11: predict_submit + collect pipelining ---
+    /// Submit GPU work for two forked handles before collecting either, then verify
+    /// both results are correct. This is the primary use case for the split
+    /// predict_submit/collect API: letting the GPU work on both batches concurrently.
+    #[test]
+    fn gpu_pipelined_submit_collect() {
+        let n_features = 6;
+        let (train_x, train_y) = make_data(150, n_features, 42);
+
+        let params = RandomForestParameters::default()
+            .with_n_estimators(20)
+            .with_seed(11);
+        let mut forest = RandomForest::new(params);
+        forest.fit(&train_x.view(), &train_y.view());
+
+        let flat = FlatForest::from_forest(&forest, n_features);
+
+        // Two independent handles sharing compiled pipelines and node data.
+        let forest_a = GpuForest::from_flat_forest(&flat, 100);
+        let forest_b = forest_a.fork(100);
+
+        let (test_x_a, _) = make_data(70, n_features, 101);
+        let (test_x_b, _) = make_data(50, n_features, 202);
+        let test_a_f32 = test_x_a.mapv(|v| v as f32);
+        let test_b_f32 = test_x_b.mapv(|v| v as f32);
+
+        // CPU baseline for both batches.
+        let cpu_a = flat.predict(&test_a_f32.view());
+        let cpu_b = flat.predict(&test_b_f32.view());
+
+        // Submit both batches to the GPU without waiting for either to finish.
+        let handle_a = forest_a.predict_submit(&test_a_f32.view()).unwrap();
+        let handle_b = forest_b.predict_submit(&test_b_f32.view()).unwrap();
+
+        // Collect in submission order; both results must be correct.
+        let gpu_a = handle_a.collect();
+        let gpu_b = handle_b.collect();
+
+        assert_eq!(gpu_a.len(), 70);
+        assert_eq!(gpu_b.len(), 50);
+
+        for (i, (cpu, gpu)) in cpu_a.iter().zip(gpu_a.iter()).enumerate() {
+            assert!(
+                ((*cpu as f32) - gpu).abs() < 1e-5,
+                "batch A sample {i}: cpu={cpu}, gpu={gpu}"
+            );
+        }
+        for (i, (cpu, gpu)) in cpu_b.iter().zip(gpu_b.iter()).enumerate() {
+            assert!(
+                ((*cpu as f32) - gpu).abs() < 1e-5,
+                "batch B sample {i}: cpu={cpu}, gpu={gpu}"
             );
         }
     }

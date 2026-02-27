@@ -81,13 +81,24 @@ Uses `0..=self.meta.max_depth` (inclusive), not `max_tree_size`. This matches th
 
 **GpuForest API (wgpu 28):**
 - `GpuForest::from_flat_forest(flat: &FlatForest, max_samples: usize) -> GpuForest` — creates GPU buffers sized for up to `max_samples` rows. Pre-allocates 4 buffers at init; no per-call VRAM allocation.
-- `GpuForest::fork(&self, max_samples: usize) -> GpuForest` — clones the `Arc<GpuForestShared>` (device, queue, pipelines, static node/meta buffers) and allocates fresh per-instance buffers. Use this to get per-thread handles without recompiling shaders or re-uploading node data.
+- `GpuForest::fork(&self, max_samples: usize) -> GpuForest` — clones the `Arc<GpuForestShared>` (device, queue, pipelines, static node/meta buffers) and allocates fresh per-instance buffers. Use this to get per-thread handles without recompiling shaders or re-uploading node data. Inherits `collect_timeout` from the parent.
+- `GpuForest::is_uma() -> bool` — returns `true` when the adapter supports `MAPPABLE_PRIMARY_BUFFERS` (Apple Silicon, Vulkan/DX12 UMA). Useful for logging/telemetry.
+- `GpuForest::with_collect_timeout(Duration) -> GpuForest` — builder method to set the maximum wait time for `PredictHandle::collect`. Default: 10 seconds. Returns `self` for chaining after `from_flat_forest`.
 - `GpuForest::predict(&ArrayView2<f32>) -> Array1<f32>` — calls `predict_submit` then `collect`. Uses `X.as_standard_layout()` internally to get a contiguous slice (zero-copy if already C-order).
-- `GpuForest::predict_submit(&ArrayView2<f32>) -> Option<PredictHandle<'_>>` — submits GPU work immediately; returns `None` for empty input. `PredictHandle::collect() -> Array1<f32>` blocks until done. Use submit+collect to overlap GPU work across multiple forests.
-- Writes features via `queue.write_buffer`, creates sub-range bind groups so `arrayLength()` in the shader sees `n_samples` (not `max_samples`), submits, waits with `device.poll(PollType::Wait { submission_index: Some(idx), timeout: None })`, reads staging buffer, calls `staging_buffer.unmap()`.
+- `GpuForest::predict_submit(&ArrayView2<f32>) -> Option<PredictHandle<'_>>` — submits GPU work immediately; returns `None` for empty input. `PredictHandle::collect() -> Array1<f32>` blocks until done (up to `collect_timeout`). Use submit+collect to overlap GPU work across multiple forests. **Panics if called while a previous `PredictHandle` is still outstanding** (busy flag via `AtomicBool`).
 - Sub-range binding: pass `wgpu::BufferBinding { buffer, offset: 0, size: Some(BufferSize::new(feature_bytes)) }` — this is essential for `arrayLength()` to reflect the actual batch size, not buffer capacity.
-- wgpu 28 poll API: `queue.submit()` returns a `SubmissionIndex`; pass it to `device.poll(PollType::Wait { submission_index: Some(idx), timeout: None })` for per-submission blocking wait.
+- wgpu 28 poll API: `queue.submit()` returns a `SubmissionIndex`; pass it to `device.poll(PollType::Wait { submission_index: Some(idx), timeout: Some(duration) })` for per-submission blocking wait with timeout.
 - Always call `staging_buffer.unmap()` after reading from a pre-allocated (reused) staging buffer, so the next `encoder.copy_buffer_to_buffer` + map cycle works correctly.
+
+**UMA (Unified Memory Architecture) optimisation:**
+- Detection: `adapter.features().contains(MAPPABLE_PRIMARY_BUFFERS)`, requested in `DeviceDescriptor::required_features`. Stored as `GpuForestShared::uma`; forked handles inherit it.
+- Feature upload on UMA: `STORAGE | MAP_WRITE` buffer, mapped directly via `map_async(Write)` + `poll(Wait { submission_index: None, timeout: Some(1s) })` + `copy_from_slice`. No staging blit. The 1-second timeout catches wgpu validation errors that would otherwise hang.
+- Output readback on UMA: `STORAGE | MAP_READ` buffer mapped directly via `map_async(Read)`; no `copy_buffer_to_buffer` + staging buffer needed.
+- On discrete GPUs: feature upload uses `queue.write_buffer` (STORAGE | COPY_DST); output copied to a `COPY_DST | MAP_READ` staging buffer before readback.
+- `staging_buffer: Option<wgpu::Buffer>` is `None` on UMA, `Some(...)` on discrete.
+
+**Busy flag (double-submit guard):**
+- `GpuForest::busy: AtomicBool` — set to `true` via `swap(true, Acquire)` at the start of `predict_submit`, reset to `false` via `store(false, Release)` at the end of `PredictHandle::collect`. Panics with "outstanding PredictHandle" if `predict_submit` is called while a handle is still live.
 
 **wgpu 28 pipeline overridable constants (workgroup size):**
 - WGSL: `override wg_size: u32 = 64u;` at top of shader, then `@compute @workgroup_size(wg_size, 1, 1)`. Override expressions are valid in `@workgroup_size`.

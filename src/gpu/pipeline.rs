@@ -1,6 +1,8 @@
 use crate::flat_forest::{FlatForest, FlatNode, ForestMeta};
 use ndarray::{Array1, ArrayView2};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use wgpu::util::DeviceExt;
 
 /// GPU state shared across all [`GpuForest`] instances forked from the same forest.
@@ -46,10 +48,14 @@ impl<'forest> PredictHandle<'forest> {
     /// Block until the GPU finishes this submission and return the predictions.
     ///
     /// One `f32` per sample, in the same order as the input to [`GpuForest::predict_submit`].
+    ///
+    /// Panics if the GPU does not complete within the timeout configured via
+    /// [`GpuForest::with_collect_timeout`] (default: 10 seconds).
     pub fn collect(self) -> Array1<f32> {
         let device = &self.forest.shared.device;
+        let timeout = self.forest.collect_timeout;
 
-        if self.forest.shared.uma {
+        let result = if self.forest.shared.uma {
             // UMA path: output_buffer has MAP_READ usage, so we read directly
             // without a staging copy. The poll also waits for the GPU submission.
             let slice = self.forest.output_buffer.slice(..self.output_bytes);
@@ -59,9 +65,9 @@ impl<'forest> PredictHandle<'forest> {
             device
                 .poll(wgpu::PollType::Wait {
                     submission_index: Some(self.submit_idx),
-                    timeout: Some(std::time::Duration::from_secs(10)),
+                    timeout: Some(timeout),
                 })
-                .expect("GPU poll failed");
+                .expect("GPU timed out during inference; consider increasing the timeout with GpuForest::with_collect_timeout");
             let data = slice.get_mapped_range();
             let result = Array1::from(bytemuck::cast_slice::<u8, f32>(&data).to_vec());
             drop(data);
@@ -78,15 +84,19 @@ impl<'forest> PredictHandle<'forest> {
             device
                 .poll(wgpu::PollType::Wait {
                     submission_index: Some(self.submit_idx),
-                    timeout: Some(std::time::Duration::from_secs(10)),
+                    timeout: Some(timeout),
                 })
-                .expect("GPU poll failed");
+                .expect("GPU timed out during inference; consider increasing the timeout with GpuForest::with_collect_timeout");
             let data = buffer_slice.get_mapped_range();
             let result = Array1::from(bytemuck::cast_slice::<u8, f32>(&data).to_vec());
             drop(data);
             staging.unmap();
             result
-        }
+        };
+
+        // Release the busy flag so predict_submit can be called again.
+        self.forest.busy.store(false, Ordering::Release);
+        result
     }
 }
 
@@ -118,6 +128,15 @@ pub struct GpuForest {
     /// Discrete: `COPY_DST | MAP_READ`, sized for `max_samples * 4` bytes.
     staging_buffer: Option<wgpu::Buffer>,
     max_samples: usize,
+    /// Maximum time [`PredictHandle::collect`] will wait for the GPU.
+    /// Default: 10 seconds.
+    collect_timeout: Duration,
+    /// Set to `true` while a [`PredictHandle`] is outstanding. Guards against
+    /// calling [`predict_submit`] again before the previous handle is collected,
+    /// which would overwrite the feature buffer while the GPU may still read it.
+    ///
+    /// [`predict_submit`]: GpuForest::predict_submit
+    busy: AtomicBool,
 }
 
 impl GpuForest {
@@ -337,6 +356,8 @@ impl GpuForest {
             output_buffer,
             staging_buffer,
             max_samples,
+            collect_timeout: Duration::from_secs(10),
+            busy: AtomicBool::new(false),
         }
     }
 
@@ -348,9 +369,44 @@ impl GpuForest {
     /// to call [`predict`] on from a single thread concurrently with `self` or
     /// any other forked handle.
     ///
+    /// The forked handle inherits the [`collect_timeout`] of `self`.
+    ///
     /// [`predict`]: GpuForest::predict
+    /// [`collect_timeout`]: GpuForest::with_collect_timeout
     pub fn fork(&self, max_samples: usize) -> Self {
-        Self::alloc_buffers(Arc::clone(&self.shared), max_samples)
+        let mut forked = Self::alloc_buffers(Arc::clone(&self.shared), max_samples);
+        forked.collect_timeout = self.collect_timeout;
+        forked
+    }
+
+    /// Set the maximum time [`PredictHandle::collect`] will wait for the GPU.
+    ///
+    /// The default is 10 seconds, which is sufficient for normal workloads. For
+    /// very large forests or slow adapters, increase this to avoid spurious panics.
+    ///
+    /// ```rust,no_run
+    /// # use biosphere::{FlatForest, RandomForest, RandomForestParameters};
+    /// # use biosphere::gpu::GpuForest;
+    /// # use ndarray::Array2;
+    /// # let flat = FlatForest::from_forest(
+    /// #     &{ let mut f = RandomForest::new(RandomForestParameters::default());
+    /// #        f.fit(&Array2::<f64>::zeros((2,1)).view(), &ndarray::Array1::zeros(2).view()); f },
+    /// #     1);
+    /// let gpu_forest = GpuForest::from_flat_forest(&flat, 1024)
+    ///     .with_collect_timeout(std::time::Duration::from_secs(60));
+    /// ```
+    pub fn with_collect_timeout(mut self, timeout: Duration) -> Self {
+        self.collect_timeout = timeout;
+        self
+    }
+
+    /// Returns `true` if this forest is running on a unified-memory adapter
+    /// (Apple Silicon, Vulkan UMA, DX12 UMA).
+    ///
+    /// On UMA devices, feature upload and output readback use direct buffer
+    /// mapping instead of staging copies, reducing memory bandwidth usage.
+    pub fn is_uma(&self) -> bool {
+        self.shared.uma
     }
 
     /// Submit a batch inference job to the GPU and return a handle to collect results later.
@@ -366,13 +422,22 @@ impl GpuForest {
     ///
     /// # Panics
     ///
-    /// Panics if `X.nrows() > max_samples` (the value passed to [`GpuForest::from_flat_forest`])
-    /// or if `X.ncols() != n_features`.
+    /// - If `X.nrows() > max_samples` (the value passed to [`GpuForest::from_flat_forest`]).
+    /// - If `X.ncols() != n_features`.
+    /// - If called while a previously returned [`PredictHandle`] has not yet been collected
+    ///   (would overwrite the feature buffer while the GPU is still reading it).
     pub fn predict_submit(&self, X: &ArrayView2<f32>) -> Option<PredictHandle<'_>> {
         let n_samples = X.nrows();
         if n_samples == 0 {
             return None;
         }
+
+        assert!(
+            !self.busy.swap(true, Ordering::Acquire),
+            "predict_submit called on a GpuForest that already has an outstanding PredictHandle; \
+             call collect() on the previous handle before submitting again"
+        );
+
         assert!(
             n_samples <= self.max_samples,
             "n_samples={n_samples} exceeds max_samples={}",
@@ -403,9 +468,9 @@ impl GpuForest {
 
         if shared.uma {
             // UMA path: map feature_buffer directly and write without a staging blit.
-            // The buffer is guaranteed to be free here — the caller must have collected
-            // (or never started) the previous PredictHandle before calling predict_submit
-            // again on the same GpuForest. The poll should return immediately.
+            // The buffer is guaranteed to be free here (enforced by the busy flag above).
+            // Use a bounded 1-second timeout to detect wgpu validation errors that would
+            // otherwise block forever.
             let slice = self.feature_buffer.slice(..feature_bytes);
             slice.map_async(wgpu::MapMode::Write, |r| {
                 r.expect("feature buffer map failed");
@@ -413,9 +478,12 @@ impl GpuForest {
             device
                 .poll(wgpu::PollType::Wait {
                     submission_index: None,
-                    timeout: None,
+                    timeout: Some(Duration::from_secs(1)),
                 })
-                .expect("GPU poll for feature buffer map failed");
+                .expect(
+                    "GPU timed out waiting for UMA feature buffer to become available; \
+                     a wgpu validation error may have occurred",
+                );
             {
                 let mut mapped = slice.get_mapped_range_mut();
                 mapped.copy_from_slice(bytemuck::cast_slice(features));

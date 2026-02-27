@@ -58,6 +58,47 @@
 //!                           Array1<f32> output
 //! ```
 //!
+//! # Pipelining — overlapping GPU work across batches
+//!
+//! [`GpuForest::predict`] submits work and blocks until results are ready.
+//! For higher throughput, use [`GpuForest::predict_submit`] to start GPU work
+//! immediately and [`PredictHandle::collect`] to retrieve results later.
+//! Submitting from two forked handles before collecting either lets the GPU
+//! run both jobs concurrently.
+//!
+//! ```rust,no_run
+//! use biosphere::{FlatForest, RandomForest, RandomForestParameters};
+//! use biosphere::gpu::GpuForest;
+//! use ndarray::Array2;
+//!
+//! # let flat = FlatForest::from_forest(
+//! #     &{ let mut f = RandomForest::new(RandomForestParameters::default());
+//! #        f.fit(&Array2::<f64>::zeros((2,2)).view(), &ndarray::Array1::zeros(2).view()); f },
+//! #     2);
+//! // Two handles sharing compiled pipelines and uploaded node data.
+//! let forest_a = GpuForest::from_flat_forest(&flat, 1024);
+//! let forest_b = forest_a.fork(1024);
+//!
+//! let batch_a: Array2<f32> = /* ... first batch ... */
+//! # Array2::zeros((1, 2));
+//! let batch_b: Array2<f32> = /* ... second batch ... */
+//! # Array2::zeros((1, 2));
+//!
+//! // Submit both without waiting — the GPU can work on them concurrently.
+//! let handle_a = forest_a.predict_submit(&batch_a.view()).unwrap();
+//! let handle_b = forest_b.predict_submit(&batch_b.view()).unwrap();
+//!
+//! // Collect in any order; each blocks only until its own submission is done.
+//! let preds_a = handle_a.collect();
+//! let preds_b = handle_b.collect();
+//! ```
+//!
+//! Each [`GpuForest`] instance enforces a single-outstanding-handle constraint:
+//! calling [`predict_submit`] again before collecting the previous handle panics.
+//! Use [`GpuForest::fork`] to get independent handles.
+//!
+//! [`predict_submit`]: GpuForest::predict_submit
+//!
 //! # Precision
 //!
 //! [`FlatForest`] stores thresholds and leaf values as `f32`. CPU inference

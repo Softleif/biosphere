@@ -204,9 +204,17 @@ mod tests {
     use rand::SeedableRng;
     use rand::rngs::StdRng;
 
-    fn make_data(n_samples: usize, n_features: usize, seed: u64) -> (Array2<f64>, ndarray::Array1<f64>) {
+    fn make_data(
+        n_samples: usize,
+        n_features: usize,
+        seed: u64,
+    ) -> (Array2<f64>, ndarray::Array1<f64>) {
         let mut rng = StdRng::seed_from_u64(seed);
-        let X = Array2::random_using((n_samples, n_features), Uniform::new(0.0, 1.0).unwrap(), &mut rng);
+        let X = Array2::random_using(
+            (n_samples, n_features),
+            Uniform::new(0.0, 1.0).unwrap(),
+            &mut rng,
+        );
         let y = X.column(0).to_owned();
         (X, y)
     }
@@ -252,6 +260,75 @@ mod tests {
                     tree_nodes[i].left < 0,
                     "tree {tree_idx}, slot {i} (beyond real size {real_count}): expected dummy leaf, got left={}",
                     tree_nodes[i].left
+                );
+            }
+        }
+    }
+
+    /// `max_tree_size` must equal the actual maximum node count, not the BFS positional
+    /// formula `2^(max_depth+1) - 1` (test #3). For unconstrained trees deep enough that
+    /// the positional layout would differ, the two values must diverge.
+    #[test]
+    fn max_tree_size_is_actual_count_not_bfs_formula() {
+        let (X, y) = make_data(150, 6, 42);
+        let params = RandomForestParameters::default()
+            .with_n_estimators(10)
+            .with_seed(42);
+        let mut forest = RandomForest::new(params);
+        forest.fit(&X.view(), &y.view());
+
+        let flat = FlatForest::from_forest(&forest, 6);
+
+        // Independent recomputation of max node count using the private helper.
+        let expected_max = forest
+            .trees()
+            .iter()
+            .map(|t| count_nodes(t.root()))
+            .max()
+            .unwrap();
+        assert_eq!(
+            flat.max_tree_size as usize, expected_max,
+            "max_tree_size should equal the actual max node count across trees"
+        );
+
+        // For trees with max_depth >= 4, the positional BFS layout would require
+        // at least 2^5 - 1 = 31 nodes, whereas typical trees with the same depth
+        // but sparse structure will have far fewer. Assert we use the compact count.
+        let bfs_formula = (1usize << (flat.max_depth as usize + 1)).saturating_sub(1);
+        if flat.max_depth >= 4 {
+            assert!(
+                (flat.max_tree_size as usize) < bfs_formula,
+                "max_tree_size ({}) should be less than BFS formula ({}) for depth-{} trees",
+                flat.max_tree_size,
+                bfs_formula,
+                flat.max_depth
+            );
+        }
+    }
+
+    /// Every padding node beyond a tree's real BFS footprint must have `value == 0.0` (test #5).
+    /// This verifies that `FlatNode::dummy_leaf()` initialises `value` to zero, so padding
+    /// slots cannot accidentally contribute non-zero predictions if the loop bound is wrong.
+    #[test]
+    fn dummy_leaf_value_is_zero() {
+        let (X, y) = make_data(150, 8, 50);
+        let params = RandomForestParameters::default()
+            .with_n_estimators(10)
+            .with_seed(50);
+        let mut forest = RandomForest::new(params);
+        forest.fit(&X.view(), &y.view());
+
+        let flat = FlatForest::from_forest(&forest, 8);
+        let max_tree_size = flat.max_tree_size as usize;
+
+        for tree_idx in 0..flat.n_trees as usize {
+            let offset = tree_idx * max_tree_size;
+            let tree_nodes = &flat.nodes[offset..offset + max_tree_size];
+            let real_count = count_bfs_nodes(tree_nodes);
+            for i in real_count..max_tree_size {
+                assert_eq!(
+                    tree_nodes[i].value, 0.0,
+                    "tree {tree_idx}, padding slot {i}: expected value=0.0"
                 );
             }
         }
