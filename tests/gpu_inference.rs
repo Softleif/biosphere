@@ -44,9 +44,8 @@ mod gpu_tests {
         let cpu_preds = flat.predict(&test_x.view());
 
         let gpu_forest = GpuForest::from_flat_forest(&flat, 100);
-        // Convert test features to f32 row-major.
-        let features_f32: Vec<f32> = test_x.iter().map(|&v| v as f32).collect();
-        let gpu_preds = gpu_forest.predict(&features_f32, 100);
+        let test_x_f32 = test_x.mapv(|v| v as f32);
+        let gpu_preds = gpu_forest.predict(&test_x_f32.view());
 
         // Both FlatForest and GpuForest use f32 nodes and f32 comparisons.
         // The only difference is f64 vs f32 accumulation; tolerance ~1e-5.
@@ -75,8 +74,8 @@ mod gpu_tests {
         let cpu_preds = flat.predict(&test_x.view());
 
         let gpu_forest = GpuForest::from_flat_forest(&flat, 1);
-        let features_f32: Vec<f32> = test_x.iter().map(|&v| v as f32).collect();
-        let gpu_preds = gpu_forest.predict(&features_f32, 1);
+        let test_x_f32 = test_x.mapv(|v| v as f32);
+        let gpu_preds = gpu_forest.predict(&test_x_f32.view());
 
         assert!(
             ((cpu_preds[0] as f32) - gpu_preds[0]).abs() < 1e-5,

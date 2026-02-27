@@ -25,12 +25,11 @@
 //! // 3. Upload to the GPU, reserving capacity for up to 1024 samples per call.
 //! let gpu_forest = GpuForest::from_flat_forest(&flat, 1024);
 //!
-//! // 4. Run inference. Features must be f32, row-major (n_samples × n_features).
+//! // 4. Run inference. Features must be f32 (cast from f64 if needed).
 //! let test_X: Array2<f64> = /* ... your test data ... */
 //! # Array2::zeros((1, 1));
-//! let n_samples = test_X.nrows();
-//! let features_f32: Vec<f32> = test_X.iter().map(|&v| v as f32).collect();
-//! let predictions: Vec<f32> = gpu_forest.predict(&features_f32, n_samples);
+//! let test_X_f32 = test_X.mapv(|v| v as f32);
+//! let predictions: ndarray::Array1<f32> = gpu_forest.predict(&test_X_f32.view());
 //! ```
 //!
 //! # Data flow
@@ -56,7 +55,7 @@
 //!                        │  mean across trees      │
 //!                        └──────────┬─────────────┘
 //!                                   │
-//!                              Vec<f32> output
+//!                           Array1<f32> output
 //! ```
 //!
 //! # Precision

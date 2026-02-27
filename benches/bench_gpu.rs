@@ -54,7 +54,7 @@ fn benchmark_predict(c: &mut Criterion) {
     for &n in SAMPLE_SIZES {
         let X_infer = make_X(n, 1);
         // Pre-convert to f32 once; the conversion itself is not under measurement.
-        let X_f32: Vec<f32> = X_infer.iter().map(|&v| v as f32).collect();
+        let X_f32 = X_infer.mapv(|v| v as f32);
 
         group.throughput(Throughput::Elements(n as u64));
 
@@ -67,7 +67,7 @@ fn benchmark_predict(c: &mut Criterion) {
         });
 
         group.bench_with_input(BenchmarkId::new("GpuForest", n), &n, |b, _| {
-            b.iter(|| gpu.predict(&X_f32, n))
+            b.iter(|| gpu.predict(&X_f32.view()))
         });
     }
 
