@@ -388,7 +388,9 @@ impl GpuForest {
 
         // Ensure row-major contiguous layout (zero-copy if already standard layout).
         let X_c = X.as_standard_layout();
-        let features = X_c.as_slice().expect("standard layout is always contiguous");
+        let features = X_c
+            .as_slice()
+            .expect("standard layout is always contiguous");
 
         let shared = &self.shared;
         let device = &shared.device;

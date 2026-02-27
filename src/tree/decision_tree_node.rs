@@ -244,8 +244,12 @@ impl DecisionTreeNode {
         // any index directly (O(1)) instead of using Vec::insert (O(n_features)).
         // Safety: the empty slice is never read before being overwritten; every
         // slot is assigned exactly once during the loop or the deferred block.
-        let mut new_samples_left: Vec<&mut [usize]> = (0..n_features).map(|_| -> &mut [usize] { &mut [] }).collect();
-        let mut new_samples_right: Vec<&mut [usize]> = (0..n_features).map(|_| -> &mut [usize] { &mut [] }).collect();
+        let mut new_samples_left: Vec<&mut [usize]> = (0..n_features)
+            .map(|_| -> &mut [usize] { &mut [] })
+            .collect();
+        let mut new_samples_right: Vec<&mut [usize]> = (0..n_features)
+            .map(|_| -> &mut [usize] { &mut [] })
+            .collect();
 
         let mut first_left: &mut [usize] = &mut [];
         right_scratch.clear();

@@ -53,7 +53,12 @@ pub struct FlatNode {
 
 impl FlatNode {
     fn dummy_leaf() -> Self {
-        FlatNode { left: -1, right: -1, feature_index: 0, value: 0.0 }
+        FlatNode {
+            left: -1,
+            right: -1,
+            feature_index: 0,
+            value: 0.0,
+        }
     }
 }
 

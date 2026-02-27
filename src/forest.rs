@@ -261,11 +261,8 @@ impl RandomForest {
                 .into_par_iter()
                 .map(move |seed| {
                     let mut rng = StdRng::seed_from_u64(seed);
-                    let mut tree = DecisionTree::new(
-                        tree_parameters
-                            .clone()
-                            .with_random_state(seed),
-                    );
+                    let mut tree =
+                        DecisionTree::new(tree_parameters.clone().with_random_state(seed));
 
                     let weights = sample_weights(X.nrows(), &mut rng);
                     let mut samples = sample_indices_from_weights(&weights, &indices);
@@ -297,9 +294,14 @@ impl RandomForest {
         }
 
         Array1::from_iter(
-            oob_predictions.iter().zip(oob_n_estimators.iter()).map(|(&pred, &n)| {
-                if n == 0 { f64::NAN } else { pred / n as f64 }
-            })
+            oob_predictions
+                .iter()
+                .zip(oob_n_estimators.iter())
+                .map(
+                    |(&pred, &n)| {
+                        if n == 0 { f64::NAN } else { pred / n as f64 }
+                    },
+                ),
         )
     }
 }
