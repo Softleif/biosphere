@@ -23,20 +23,16 @@ pub struct ForestMeta {
 
 /// A single node in a flat tree stored in BFS visit order.
 ///
-/// Internal nodes use `feature_index`, `threshold`, `left`, and `right`.
-/// Leaf nodes use `leaf_value`; `left` and `right` are -1.
+/// Internal nodes use `feature_index`, `value` (as threshold), `left`, and `right`.
+/// Leaf nodes use `value` (as the leaf prediction); `left` and `right` are -1.
+///
+/// `value` is a dual-purpose field: it holds the split threshold for internal
+/// nodes and the leaf prediction for leaf nodes. The two interpretations never
+/// overlap — `left < 0` unambiguously identifies leaves. This alias shrinks the
+/// struct from 20 → 16 bytes, fitting exactly 4 nodes per 64-byte cache line.
 ///
 /// Child indices are explicit offsets into the per-tree node slice, so trees
 /// of any shape can be stored without exponential padding.
-///
-/// Field order: traversal-hot fields (`left`, `right`, `feature_index`,
-/// `threshold`) come first, the leaf-only field (`leaf_value`) last.
-/// `is_leaf` was removed — `left < 0` encodes leaf status without redundancy
-/// and without the 4-byte overhead that a separate boolean flag would require.
-///
-/// All floating-point values use `f32`, matching the GPU representation.
-/// CPU `predict_one` casts feature values to `f32` before comparison so that
-/// the CPU and GPU traversal paths are identical.
 ///
 /// NOTE: field order and types are significant for binary serde (e.g. postcard)
 /// and for direct GPU upload via bytemuck. Changing them requires a migration step
@@ -51,19 +47,13 @@ pub struct FlatNode {
     /// Index of the right child within the tree's node slice, or -1 for leaves.
     pub right: i32,
     pub feature_index: u32,
-    pub threshold: f32,
-    pub leaf_value: f32,
+    /// Split threshold for internal nodes; leaf prediction for leaf nodes.
+    pub value: f32,
 }
 
 impl FlatNode {
     fn dummy_leaf() -> Self {
-        FlatNode {
-            left: -1,
-            right: -1,
-            feature_index: 0,
-            threshold: 0.0,
-            leaf_value: 0.0,
-        }
+        FlatNode { left: -1, right: -1, feature_index: 0, value: 0.0 }
     }
 }
 
@@ -182,10 +172,10 @@ impl FlatForest {
         for _ in 0..self.meta.max_tree_size as usize {
             let node = &self.nodes[offset + idx];
             if node.left < 0 {
-                return node.leaf_value as f64;
+                return node.value as f64;
             }
             // Cast feature to f32 to match GPU traversal exactly.
-            if (features[node.feature_index as usize] as f32) < node.threshold {
+            if (features[node.feature_index as usize] as f32) < node.value {
                 idx = node.left as usize;
             } else {
                 idx = node.right as usize;
@@ -231,8 +221,7 @@ fn fill_bfs(root: &DecisionTreeNode, nodes: &mut [FlatNode]) {
                 left: -1,
                 right: -1,
                 feature_index: 0,
-                threshold: 0.0,
-                leaf_value: node.label.unwrap() as f32,
+                value: node.label.unwrap() as f32,
             };
         } else {
             let left_idx = next_slot;
@@ -244,8 +233,7 @@ fn fill_bfs(root: &DecisionTreeNode, nodes: &mut [FlatNode]) {
                 left: left_idx as i32,
                 right: right_idx as i32,
                 feature_index: node.feature_index.unwrap() as u32,
-                threshold: node.feature_value.unwrap() as f32,
-                leaf_value: 0.0,
+                value: node.feature_value.unwrap() as f32,
             };
 
             queue.push_back((node.left_child.as_ref().unwrap(), left_idx));

@@ -6,8 +6,10 @@
 // Nodes are stored in BFS visit order with explicit left/right child indices,
 // so trees of any depth and shape are supported without exponential padding.
 // Field layout matches FlatNode in flat_forest.rs exactly (repr(C), all 4-byte
-// fields): left, right, feature_index, threshold, leaf_value.
-// A node is a leaf when left < 0.
+// fields): left, right, feature_index, value.
+// `value` is the split threshold for internal nodes and the leaf prediction for
+// leaf nodes (left < 0 distinguishes the two cases).
+// This alias keeps Node at 16 bytes = 4 nodes per 64-byte cache line.
 //
 // Dispatch: (ceil(n_samples / 64), n_trees, 1)
 // Workgroup size: (64, 1, 1)
@@ -16,8 +18,7 @@ struct Node {
     left: i32,
     right: i32,
     feature_index: u32,
-    threshold: f32,
-    leaf_value: f32,
+    value: f32,  // threshold (internal) or leaf prediction (leaf)
 }
 
 struct Meta {
@@ -51,17 +52,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var i: u32 = 0u; i <= forest_meta.max_depth; i = i + 1u) {
         let node = nodes[tree_offset + node_idx];
         if node.left < 0 {
-            per_tree_preds[tree_id * n_samples + sample_id] = node.leaf_value;
+            per_tree_preds[tree_id * n_samples + sample_id] = node.value;
             return;
         }
         let feat_val = features[sample_id * forest_meta.n_features + node.feature_index];
         // Use strict < to match biosphere's CPU inference exactly.
-        if feat_val < node.threshold {
+        if feat_val < node.value {
             node_idx = u32(node.left);
         } else {
             node_idx = u32(node.right);
         }
     }
     // Fallback: should not reach here for well-formed trees.
-    per_tree_preds[tree_id * n_samples + sample_id] = nodes[tree_offset + node_idx].leaf_value;
+    per_tree_preds[tree_id * n_samples + sample_id] = nodes[tree_offset + node_idx].value;
 }
