@@ -175,21 +175,20 @@ impl FlatForest {
     fn predict_one(&self, tree_idx: usize, features: &[f32]) -> f64 {
         let offset = tree_idx * self.meta.max_tree_size as usize;
         let mut idx = 0usize;
-        for _ in 0..self.meta.max_tree_size as usize {
+        for _ in 0..=self.meta.max_depth as usize {
             let node = &self.nodes[offset + idx];
             if node.left < 0 {
                 return node.value as f64;
             }
-            // Cast feature to f32 to match GPU traversal exactly.
-            if (features[node.feature_index as usize] as f32) < node.value {
+            if features[node.feature_index as usize] < node.value {
                 idx = node.left as usize;
             } else {
                 idx = node.right as usize;
             }
         }
         panic!(
-            "predict_one: traversal exceeded max_tree_size ({}); tree may be malformed",
-            self.meta.max_tree_size
+            "predict_one: traversal exceeded max_depth ({}); tree may be malformed",
+            self.meta.max_depth
         );
     }
 }
