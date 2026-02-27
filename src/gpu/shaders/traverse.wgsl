@@ -11,8 +11,12 @@
 // leaf nodes (left < 0 distinguishes the two cases).
 // This alias keeps Node at 16 bytes = 4 nodes per 64-byte cache line.
 //
-// Dispatch: (ceil(n_samples / 64), n_trees, 1)
-// Workgroup size: (64, 1, 1)
+// Dispatch: (ceil(n_samples / wg_size), n_trees, 1)
+// Workgroup size: (wg_size, 1, 1) — set at pipeline-compile time via override.
+
+/// Number of threads per workgroup in the X dimension.
+/// Overridden at pipeline-compile time with the value queried from device limits.
+override wg_size: u32 = 64u;
 
 struct Node {
     left: i32,
@@ -35,7 +39,7 @@ struct Meta {
 // per_tree_preds: column-major, shape (n_trees, n_samples)
 @group(0) @binding(3) var<storage, read_write> per_tree_preds: array<f32>;
 
-@compute @workgroup_size(64, 1, 1)
+@compute @workgroup_size(wg_size, 1, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let n_samples = arrayLength(&features) / forest_meta.n_features;
     let sample_id = gid.x;

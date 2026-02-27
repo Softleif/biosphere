@@ -19,6 +19,8 @@ struct GpuForestShared {
     /// Static buffer holding forest metadata. Never mutated after upload.
     meta_buffer: wgpu::Buffer,
     meta: ForestMeta,
+    /// Workgroup size chosen from device limits at pipeline-compile time.
+    workgroup_size: u32,
 }
 
 /// A submitted GPU inference job awaiting results.
@@ -159,6 +161,17 @@ impl GpuForest {
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/reduce.wgsl").into()),
         });
 
+        // --- Workgroup size ---
+        // Clamp to 256: larger groups rarely help for memory-bandwidth-bound kernels
+        // and can hurt occupancy. Both limits are checked: the per-workgroup cap and
+        // the per-dimension cap (relevant for our 1-D (wg_size, 1, 1) dispatch).
+        let limits = device.limits();
+        let workgroup_size = limits
+            .max_compute_invocations_per_workgroup
+            .min(limits.max_compute_workgroup_size_x)
+            .min(256);
+        let wg_constants = [("wg_size", workgroup_size as f64)];
+
         // --- Compute pipelines ---
         let traverse_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("biosphere::gpu::traverse_layout"),
@@ -171,7 +184,10 @@ impl GpuForest {
             layout: Some(&traverse_layout),
             module: &traverse_shader,
             entry_point: Some("main"),
-            compilation_options: Default::default(),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &wg_constants,
+                ..Default::default()
+            },
             cache: None,
         });
 
@@ -186,7 +202,10 @@ impl GpuForest {
             layout: Some(&reduce_layout),
             module: &reduce_shader,
             entry_point: Some("main"),
-            compilation_options: Default::default(),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &wg_constants,
+                ..Default::default()
+            },
             cache: None,
         });
 
@@ -200,6 +219,7 @@ impl GpuForest {
             node_buffer,
             meta_buffer,
             meta: flat.meta,
+            workgroup_size,
         });
 
         Self::alloc_buffers(shared, max_samples)
@@ -363,7 +383,7 @@ impl GpuForest {
             });
             cpass.set_pipeline(&shared.traverse_pipeline);
             cpass.set_bind_group(0, &traverse_bg, &[]);
-            let x_groups = n_samples.div_ceil(64) as u32;
+            let x_groups = n_samples.div_ceil(shared.workgroup_size as usize) as u32;
             cpass.dispatch_workgroups(x_groups, shared.meta.n_trees, 1);
         }
 
@@ -374,7 +394,7 @@ impl GpuForest {
             });
             cpass.set_pipeline(&shared.reduce_pipeline);
             cpass.set_bind_group(0, &reduce_bg, &[]);
-            let x_groups = n_samples.div_ceil(64) as u32;
+            let x_groups = n_samples.div_ceil(shared.workgroup_size as usize) as u32;
             cpass.dispatch_workgroups(x_groups, 1, 1);
         }
 
