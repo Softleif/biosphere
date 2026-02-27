@@ -193,6 +193,91 @@ impl FlatForest {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::RandomForest;
+    use crate::forest::RandomForestParameters;
+    use ndarray::Array2;
+    use ndarray_rand::RandomExt;
+    use ndarray_rand::rand_distr::Uniform;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+
+    fn make_data(n_samples: usize, n_features: usize, seed: u64) -> (Array2<f64>, ndarray::Array1<f64>) {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let X = Array2::random_using((n_samples, n_features), Uniform::new(0.0, 1.0).unwrap(), &mut rng);
+        let y = X.column(0).to_owned();
+        (X, y)
+    }
+
+    /// nodes.len() must always equal n_trees * max_tree_size (test #16).
+    #[test]
+    fn nodes_length_invariant() {
+        let (X, y) = make_data(120, 6, 16);
+        let params = RandomForestParameters::default()
+            .with_n_estimators(15)
+            .with_seed(16);
+        let mut forest = RandomForest::new(params);
+        forest.fit(&X.view(), &y.view());
+
+        let flat = FlatForest::from_forest(&forest, 6);
+        assert_eq!(
+            flat.nodes.len(),
+            flat.n_trees as usize * flat.max_tree_size as usize,
+            "nodes.len() should equal n_trees * max_tree_size"
+        );
+    }
+
+    /// Every slot beyond a tree's real BFS footprint must be a dummy leaf (test #15).
+    #[test]
+    fn padding_nodes_are_leaves() {
+        let (X, y) = make_data(150, 8, 15);
+        let params = RandomForestParameters::default()
+            .with_n_estimators(10)
+            .with_seed(15);
+        let mut forest = RandomForest::new(params);
+        forest.fit(&X.view(), &y.view());
+
+        let flat = FlatForest::from_forest(&forest, 8);
+        let n_trees = flat.n_trees as usize;
+        let max_tree_size = flat.max_tree_size as usize;
+
+        for tree_idx in 0..n_trees {
+            let offset = tree_idx * max_tree_size;
+            let tree_nodes = &flat.nodes[offset..offset + max_tree_size];
+            let real_count = count_bfs_nodes(tree_nodes);
+            for i in real_count..max_tree_size {
+                assert!(
+                    tree_nodes[i].left < 0,
+                    "tree {tree_idx}, slot {i} (beyond real size {real_count}): expected dummy leaf, got left={}",
+                    tree_nodes[i].left
+                );
+            }
+        }
+    }
+
+    /// Count reachable nodes from root via BFS using explicit child indices.
+    fn count_bfs_nodes(nodes: &[FlatNode]) -> usize {
+        use std::collections::VecDeque;
+        let mut queue = VecDeque::new();
+        queue.push_back(0usize);
+        let mut count = 0;
+        while let Some(idx) = queue.pop_front() {
+            if idx >= nodes.len() {
+                break;
+            }
+            count += 1;
+            let node = &nodes[idx];
+            if node.left >= 0 {
+                queue.push_back(node.left as usize);
+                queue.push_back(node.right as usize);
+            }
+        }
+        count
+    }
+}
+
 /// Recursively compute the depth of a node (0 = leaf, 1 = one split level, …).
 fn node_depth(node: &DecisionTreeNode) -> usize {
     if node.feature_index.is_none() {

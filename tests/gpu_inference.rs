@@ -4,6 +4,7 @@
 /// Requires a real GPU. This test will panic if no GPU adapter is available.
 #[cfg(feature = "gpu")]
 mod gpu_tests {
+    #![allow(non_snake_case)]
     use biosphere::gpu::GpuForest;
     use biosphere::{FlatForest, RandomForest, RandomForestParameters};
     use ndarray::Array2;
@@ -83,5 +84,110 @@ mod gpu_tests {
             cpu_preds[0],
             gpu_preds[0]
         );
+    }
+
+    // --- Test #8/#9: n_samples at workgroup boundary values ---
+    /// Tests 63, 64, 65, 127, 128, 129 samples — exercises the bounds check in the
+    /// traverse shader and the exact-workgroup-multiple fast paths.
+    #[test]
+    fn gpu_workgroup_boundaries() {
+        let n_features = 5;
+        let (train_x, train_y) = make_data(150, n_features, 42);
+
+        let params = RandomForestParameters::default()
+            .with_n_estimators(10)
+            .with_seed(1);
+        let mut forest = RandomForest::new(params);
+        forest.fit(&train_x.view(), &train_y.view());
+
+        let flat = FlatForest::from_forest(&forest, n_features);
+        // Allocate enough capacity for the largest batch we'll test.
+        let gpu_forest = GpuForest::from_flat_forest(&flat, 200);
+
+        for &n_samples in &[1usize, 63, 64, 65, 127, 128, 129] {
+            let (test_x, _) = make_data(n_samples, n_features, n_samples as u64 + 100);
+            let test_x_f32 = test_x.mapv(|v| v as f32);
+
+            let cpu_preds = flat.predict(&test_x_f32.view());
+            let gpu_preds = gpu_forest.predict(&test_x_f32.view());
+
+            assert_eq!(gpu_preds.len(), n_samples, "n_samples={n_samples}: output length mismatch");
+            for (i, (cpu, gpu)) in cpu_preds.iter().zip(gpu_preds.iter()).enumerate() {
+                assert!(
+                    ((*cpu as f32) - gpu).abs() < 1e-5,
+                    "n_samples={n_samples} sample {i}: cpu={cpu}, gpu={gpu}"
+                );
+            }
+        }
+    }
+
+    // --- Test #10: multiple predict() calls on the same GpuForest ---
+    /// Guards against accidental state mutation between calls.
+    #[test]
+    fn gpu_multiple_predict_calls() {
+        let n_features = 6;
+        let (train_x, train_y) = make_data(150, n_features, 77);
+
+        let params = RandomForestParameters::default()
+            .with_n_estimators(15)
+            .with_seed(3);
+        let mut forest = RandomForest::new(params);
+        forest.fit(&train_x.view(), &train_y.view());
+
+        let flat = FlatForest::from_forest(&forest, n_features);
+        let gpu_forest = GpuForest::from_flat_forest(&flat, 100);
+
+        let (test_x1, _) = make_data(80, n_features, 10);
+        let (test_x2, _) = make_data(60, n_features, 20);
+        let test_x1_f32 = test_x1.mapv(|v| v as f32);
+        let test_x2_f32 = test_x2.mapv(|v| v as f32);
+
+        let cpu1 = flat.predict(&test_x1_f32.view());
+        let cpu2 = flat.predict(&test_x2_f32.view());
+
+        let gpu1 = gpu_forest.predict(&test_x1_f32.view());
+        let gpu2 = gpu_forest.predict(&test_x2_f32.view());
+
+        for (i, (cpu, gpu)) in cpu1.iter().zip(gpu1.iter()).enumerate() {
+            assert!(
+                ((*cpu as f32) - gpu).abs() < 1e-5,
+                "call 1 sample {i}: cpu={cpu}, gpu={gpu}"
+            );
+        }
+        for (i, (cpu, gpu)) in cpu2.iter().zip(gpu2.iter()).enumerate() {
+            assert!(
+                ((*cpu as f32) - gpu).abs() < 1e-5,
+                "call 2 sample {i}: cpu={cpu}, gpu={gpu}"
+            );
+        }
+    }
+
+    // --- Test #11: large n_trees (500) ---
+    /// Stresses the y-dispatch dimension and the per-tree-preds buffer size.
+    #[test]
+    fn gpu_large_n_trees() {
+        let n_features = 5;
+        let (train_x, train_y) = make_data(150, n_features, 99);
+
+        let params = RandomForestParameters::default()
+            .with_n_estimators(500)
+            .with_seed(4);
+        let mut forest = RandomForest::new(params);
+        forest.fit(&train_x.view(), &train_y.view());
+
+        let flat = FlatForest::from_forest(&forest, n_features);
+        let (test_x, _) = make_data(50, n_features, 200);
+        let test_x_f32 = test_x.mapv(|v| v as f32);
+
+        let cpu_preds = flat.predict(&test_x_f32.view());
+        let gpu_forest = GpuForest::from_flat_forest(&flat, 50);
+        let gpu_preds = gpu_forest.predict(&test_x_f32.view());
+
+        for (i, (cpu, gpu)) in cpu_preds.iter().zip(gpu_preds.iter()).enumerate() {
+            assert!(
+                ((*cpu as f32) - gpu).abs() < 1e-5,
+                "sample {i}: cpu={cpu}, gpu={gpu}"
+            );
+        }
     }
 }

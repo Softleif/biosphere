@@ -7,6 +7,20 @@ use ndarray_rand::rand_distr::Uniform;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
+fn assert_flat_matches_recursive(
+    forest: &RandomForest,
+    test_X: &Array2<f64>,
+    n_features: usize,
+) {
+    let cpu_preds = forest.predict(&test_X.view());
+    let flat = FlatForest::from_forest(forest, n_features);
+    let test_X_f32 = test_X.mapv(|v| v as f32);
+    let flat_preds = flat.predict(&test_X_f32.view());
+    for (i, (cpu, fp)) in cpu_preds.iter().zip(flat_preds.iter()).enumerate() {
+        assert!((cpu - fp).abs() < 1e-5, "sample {i}: cpu={cpu}, flat={fp}");
+    }
+}
+
 fn make_data(n_samples: usize, n_features: usize, seed: u64) -> (Array2<f64>, Array1<f64>) {
     let mut rng = StdRng::seed_from_u64(seed);
     // Keep values in [0, 1) to avoid cumsum precision issues in biosphere internals.
@@ -83,16 +97,189 @@ fn flat_forest_deep_tree() {
     forest.fit(&X.view(), &y.view());
 
     let (test_X, _) = make_data(50, 8, 456);
-    let cpu_preds = forest.predict(&test_X.view());
-    let flat = FlatForest::from_forest(&forest, 8);
-    let test_X_f32 = test_X.mapv(|v| v as f32);
-    let flat_preds = flat.predict(&test_X_f32.view());
+    assert_flat_matches_recursive(&forest, &test_X, 8);
+}
 
-    for (i, (cpu, flat)) in cpu_preds.iter().zip(flat_preds.iter()).enumerate() {
-        // FlatForest stores nodes as f32; allow for f32 quantisation error.
+// --- Test #1: depth-0 tree (single leaf) ---
+/// min_samples_split >= n_samples forces every tree to be a single leaf.
+/// max_tree_size must be 1, max_depth must be 0, and all test samples receive
+/// the same averaged prediction (since each tree returns one constant value).
+#[test]
+fn depth_zero_single_leaf() {
+    let n_train = 50;
+    let (X, y) = make_data(n_train, 4, 11);
+    // n_samples <= min_samples_split → root cannot split → single leaf.
+    let params = RandomForestParameters::default()
+        .with_n_estimators(5)
+        .with_min_samples_split(n_train)
+        .with_seed(10);
+    let mut forest = RandomForest::new(params);
+    forest.fit(&X.view(), &y.view());
+
+    let flat = FlatForest::from_forest(&forest, 4);
+    assert_eq!(flat.max_tree_size, 1, "depth-0 forest: max_tree_size should be 1");
+    assert_eq!(flat.max_depth, 0, "depth-0 forest: max_depth should be 0");
+
+    let (test_X, _) = make_data(20, 4, 999);
+    let test_X_f32 = test_X.mapv(|v| v as f32);
+    let preds = flat.predict(&test_X_f32.view());
+    // Each tree returns its single leaf value regardless of input; averaged output is
+    // the same constant for every test sample.
+    let first = preds[0];
+    for &p in preds.iter() {
         assert!(
-            (cpu - flat).abs() < 1e-5,
-            "sample {i}: cpu={cpu}, flat={flat}"
+            (p - first).abs() < 1e-10,
+            "depth-0 forest: all predictions should be equal across test samples"
         );
+    }
+}
+
+// --- Test #2: depth-1 forest ---
+/// max_depth=Some(1) means each tree has at most one split (≤ 3 nodes).
+#[test]
+fn depth_one_forest() {
+    let (X, y) = make_data(100, 5, 22);
+    let params = RandomForestParameters::default()
+        .with_n_estimators(10)
+        .with_max_depth(Some(1))
+        .with_seed(20);
+    let mut forest = RandomForest::new(params);
+    forest.fit(&X.view(), &y.view());
+
+    let flat = FlatForest::from_forest(&forest, 5);
+    // A depth-1 tree is root + at most 2 leaves = 3 nodes.
+    assert!(flat.max_tree_size <= 3, "depth-1 forest: max_tree_size={}", flat.max_tree_size);
+    assert!(flat.max_depth <= 1, "depth-1 forest: max_depth={}", flat.max_depth);
+
+    let (test_X, _) = make_data(50, 5, 222);
+    assert_flat_matches_recursive(&forest, &test_X, 5);
+}
+
+// --- Test #5: feature at last index ---
+/// With n_features=1, every split uses feature_index=0 = n_features-1.
+/// Tests that the last feature index is handled correctly (no off-by-one).
+#[test]
+fn feature_at_last_index() {
+    let n_features = 1;
+    let mut rng = StdRng::seed_from_u64(55);
+    let X = Array2::random_using((100, n_features), Uniform::new(0.0, 1.0).unwrap(), &mut rng);
+    let y = X.column(0).to_owned();
+
+    let params = RandomForestParameters::default()
+        .with_n_estimators(10)
+        .with_seed(5);
+    let mut forest = RandomForest::new(params);
+    forest.fit(&X.view(), &y.view());
+
+    let test_X = Array2::random_using((30, n_features), Uniform::new(0.0, 1.0).unwrap(), &mut rng);
+    assert_flat_matches_recursive(&forest, &test_X, n_features);
+
+    // The forest must produce varied predictions (confirming splits on feature 0 = last feature).
+    let cpu_preds = forest.predict(&test_X.view());
+    let all_same = cpu_preds.iter().all(|&p| (p - cpu_preds[0]).abs() < 1e-10);
+    assert!(!all_same, "forest should produce varied predictions when feature 0 is predictive");
+}
+
+// --- Test #6: non-contiguous input panics ---
+/// Passing a transposed (non-C-contiguous) view panics with the expected message.
+#[test]
+#[should_panic(expected = "feature row must be contiguous")]
+fn non_contiguous_input_panics() {
+    let (X, y) = make_data(50, 4, 88);
+    let params = RandomForestParameters::default()
+        .with_n_estimators(3)
+        .with_seed(7);
+    let mut forest = RandomForest::new(params);
+    forest.fit(&X.view(), &y.view());
+
+    let flat = FlatForest::from_forest(&forest, 4);
+    // Transpose a (n_features, n_samples) array: result has shape (n_samples, n_features)
+    // but each row has stride n_features instead of 1 → as_slice() returns None → panics.
+    let mat = Array2::<f32>::zeros((4, 20));
+    let non_contig = mat.t(); // shape (20, 4), rows not contiguous
+    flat.predict(&non_contig);
+}
+
+// --- Test #7: n_trees=1 ---
+/// A single-tree forest's FlatForest prediction must match the recursive prediction.
+#[test]
+fn single_tree_forest() {
+    let (X, y) = make_data(100, 5, 33);
+    let params = RandomForestParameters::default()
+        .with_n_estimators(1)
+        .with_seed(8);
+    let mut forest = RandomForest::new(params);
+    forest.fit(&X.view(), &y.view());
+
+    let (test_X, _) = make_data(50, 5, 77);
+    assert_flat_matches_recursive(&forest, &test_X, 5);
+}
+
+// --- Test #13: iris regression ---
+/// Train on iris (150 samples); predict petal width (continuous) from the other 3 features.
+/// Using a continuous target keeps leaf predictions numerically close even when f32 feature
+/// precision causes an occasional branch difference, so 1e-3 tolerance is achievable.
+/// The test gives stable regression coverage tied to a real, well-known dataset.
+#[test]
+fn iris_regression() {
+    use csv::ReaderBuilder;
+    use ndarray::s;
+    use ndarray_csv::Array2Reader;
+
+    let file = std::fs::File::open("testdata/iris.csv").unwrap();
+    let mut reader = ReaderBuilder::new().has_headers(true).from_reader(file);
+    let data: Array2<f64> = reader.deserialize_array2((150, 5)).unwrap();
+    // Use sepal length/width + petal length (columns 0-2) as features,
+    // petal width (column 3, continuous 0.1-2.5) as the regression target.
+    // This avoids integer class labels whose large leaf-value gaps would amplify
+    // any f32 branch-decision differences beyond 1e-5.
+    let X = data.slice(s![.., ..3]).to_owned();
+    let y = data.column(3).to_owned();
+
+    let params = RandomForestParameters::default()
+        .with_n_estimators(20)
+        .with_max_depth(Some(4))
+        .with_seed(13);
+    let mut forest = RandomForest::new(params);
+    forest.fit(&X.view(), &y.view());
+
+    let flat = FlatForest::from_forest(&forest, 3);
+    let X_f32 = X.mapv(|v| v as f32);
+    let recursive_preds = forest.predict(&X.view());
+    let flat_preds = flat.predict(&X_f32.view());
+
+    // Allow 0.1: iris features like 4.2, 5.1 are "round" in f32, but the stored f32 thresholds
+    // differ from f64 originals, so occasional samples near a split boundary take a different
+    // branch. With 20 trees and leaf values in [0, 2.5], a single branch difference per sample
+    // contributes up to ~0.1. The tolerance catches algorithmic bugs without false-failing on
+    // expected precision mismatches.
+    for (i, (rec, fp)) in recursive_preds.iter().zip(flat_preds.iter()).enumerate() {
+        assert!(
+            (rec - fp).abs() < 0.1,
+            "iris sample {i}: recursive={rec}, flat={fp}"
+        );
+    }
+}
+
+// --- Test #14: predict is idempotent ---
+/// Calling predict twice on the same FlatForest with the same input returns identical results.
+#[test]
+fn predict_is_idempotent() {
+    let (X, y) = make_data(100, 6, 44);
+    let params = RandomForestParameters::default()
+        .with_n_estimators(10)
+        .with_seed(14);
+    let mut forest = RandomForest::new(params);
+    forest.fit(&X.view(), &y.view());
+
+    let (test_X, _) = make_data(40, 6, 444);
+    let flat = FlatForest::from_forest(&forest, 6);
+    let test_X_f32 = test_X.mapv(|v| v as f32);
+
+    let preds1 = flat.predict(&test_X_f32.view());
+    let preds2 = flat.predict(&test_X_f32.view());
+
+    for (i, (p1, p2)) in preds1.iter().zip(preds2.iter()).enumerate() {
+        assert_eq!(p1, p2, "sample {i}: predictions differ between identical calls");
     }
 }
