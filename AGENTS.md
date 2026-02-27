@@ -59,7 +59,7 @@ The `MaxFeatures` enum supports multiple feature sampling strategies:
 
 **What was built:**
 - `src/flat_forest.rs` — `FlatForest` / `FlatNode` / `ForestMeta`: flat tree array for CPU and GPU inference. Nodes in BFS visit order with **explicit child indices** (`left: i32`, `right: i32`; -1 for leaves). `max_tree_size` is the actual max node count across trees (NOT `2^(max_depth+1) - 1`). `FlatForest.meta: ForestMeta` holds the four `u32` dimensions; `FlatForest` impls `Deref<Target = ForestMeta>` for ergonomic access.
-- `src/gpu/pipeline.rs` — `GpuForest`: uploads `FlatForest` nodes **directly** (already `f32`; zero conversion), compiles WGSL pipelines with device-queried workgroup size, runs batched inference via `predict(&[f32], n_samples) -> Vec<f32>`.
+- `src/gpu/pipeline.rs` — `GpuForest`: uploads `FlatForest` nodes **directly** (already `f32`; zero conversion), compiles WGSL pipelines with device-queried workgroup size, runs batched inference via `predict(&ArrayView2<f32>) -> Array1<f32>`.
 - `src/gpu/shaders/traverse.wgsl` — 2D dispatch `(ceil(n_samples/wg_size), n_trees, 1)`, one thread per (sample, tree). Uses `u32(node.left)` / `u32(node.right)` for traversal; `max_depth` is the GPU loop safety bound.
 - `src/gpu/shaders/reduce.wgsl` — averages per-tree predictions per sample.
 - Tests: `tests/flat_forest.rs` (CPU, no feature flag), `tests/gpu_inference.rs` (requires GPU, `--features gpu`).
@@ -71,14 +71,20 @@ left: i32 | right: i32 | feature_index: u32 | value: f32
 `value` is dual-purpose: split threshold for internal nodes, leaf prediction for leaves. `left < 0` is the sole discriminant — no separate `is_leaf` field needed. 16 bytes = exactly 4 nodes per 64-byte cache line. Under `gpu` feature, `FlatNode` and `ForestMeta` derive `bytemuck::Pod + Zeroable`, so nodes upload as `bytemuck::cast_slice::<FlatNode, u8>(&flat.nodes)` with no conversion loop.
 
 **Precision model:**
-- `FlatNode` stores `value: f32`. `FlatForest::predict` casts each feature to `f32` before comparison so that CPU and GPU traversal are identical.
+- `FlatNode` stores `value: f32`. `FlatForest::predict` takes `&ArrayView2<f32>` directly — no per-split cast. `GpuForest::predict` also takes `&ArrayView2<f32>`. Both CPU and GPU traversal are therefore identical.
 - `FlatForest::predict` results differ from `RandomForest::predict` (f64) by ~1e-5 due to f32 quantisation of leaf values; use that tolerance in tests.
 - `FlatForest::predict` vs `GpuForest::predict` differ by <1e-5 (only f64 vs f32 accumulation of f32 leaf values).
+- Callers convert f64 training data once with `X.mapv(|v| v as f32)` before calling either predict.
+
+**FlatForest::predict_one loop bound:**
+Uses `0..=self.meta.max_depth` (inclusive), not `max_tree_size`. This matches the GPU shader and gives the compiler a tight, small bound (e.g. 9 iterations for depth-8 trees), enabling better optimisation. `max_depth` is computed by `node_depth()` during `from_forest` — it is the actual maximum depth across all trees, so `max_depth + 1` iterations always suffice to reach any leaf.
 
 **GpuForest API (wgpu 28):**
 - `GpuForest::from_flat_forest(flat: &FlatForest, max_samples: usize) -> GpuForest` — creates GPU buffers sized for up to `max_samples` rows. Pre-allocates 4 buffers at init; no per-call VRAM allocation.
 - `GpuForest::fork(&self, max_samples: usize) -> GpuForest` — clones the `Arc<GpuForestShared>` (device, queue, pipelines, static node/meta buffers) and allocates fresh per-instance buffers. Use this to get per-thread handles without recompiling shaders or re-uploading node data.
-- `GpuForest::predict(features: &[f32], n_samples: usize) -> Vec<f32>` — writes features via `queue.write_buffer`, creates sub-range bind groups so `arrayLength()` in the shader sees `n_samples` (not `max_samples`), submits, waits with `device.poll(PollType::Wait { submission_index: Some(idx), timeout: None })`, reads staging buffer, calls `staging_buffer.unmap()`.
+- `GpuForest::predict(&ArrayView2<f32>) -> Array1<f32>` — calls `predict_submit` then `collect`. Uses `X.as_standard_layout()` internally to get a contiguous slice (zero-copy if already C-order).
+- `GpuForest::predict_submit(&ArrayView2<f32>) -> Option<PredictHandle<'_>>` — submits GPU work immediately; returns `None` for empty input. `PredictHandle::collect() -> Array1<f32>` blocks until done. Use submit+collect to overlap GPU work across multiple forests.
+- Writes features via `queue.write_buffer`, creates sub-range bind groups so `arrayLength()` in the shader sees `n_samples` (not `max_samples`), submits, waits with `device.poll(PollType::Wait { submission_index: Some(idx), timeout: None })`, reads staging buffer, calls `staging_buffer.unmap()`.
 - Sub-range binding: pass `wgpu::BufferBinding { buffer, offset: 0, size: Some(BufferSize::new(feature_bytes)) }` — this is essential for `arrayLength()` to reflect the actual batch size, not buffer capacity.
 - wgpu 28 poll API: `queue.submit()` returns a `SubmissionIndex`; pass it to `device.poll(PollType::Wait { submission_index: Some(idx), timeout: None })` for per-submission blocking wait.
 - Always call `staging_buffer.unmap()` after reading from a pre-allocated (reused) staging buffer, so the next `encoder.copy_buffer_to_buffer` + map cycle works correctly.
