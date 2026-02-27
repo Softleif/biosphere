@@ -58,11 +58,22 @@ The `MaxFeatures` enum supports multiple feature sampling strategies:
 ## GPU Feature (`--features gpu`)
 
 **What was built:**
-- `src/flat_forest.rs` — `FlatForest` / `FlatNode`: flat tree array usable for both CPU and GPU inference. Nodes are stored in BFS visit order with **explicit child indices** (`left: i32`, `right: i32`; -1 for leaves). `max_tree_size` is the actual maximum node count across trees (NOT `2^(max_depth+1) - 1`). `FlatForest::from_forest(forest, n_features)` flattens all trees; `FlatForest::predict` matches `RandomForest::predict` exactly.
-- `src/gpu/pipeline.rs` — `GpuForest`: uploads `FlatForest` to GPU (f64→f32), compiles WGSL pipelines, runs batched inference via `predict(&[f32], n_samples) -> Vec<f32>`.
-- `src/gpu/shaders/traverse.wgsl` — 2D dispatch `(ceil(n_samples/64), n_trees, 1)`, one thread per (sample, tree). Uses `u32(node.left)` / `u32(node.right)` for traversal; `max_depth` is kept as a GPU loop safety bound only.
+- `src/flat_forest.rs` — `FlatForest` / `FlatNode` / `ForestMeta`: flat tree array for CPU and GPU inference. Nodes in BFS visit order with **explicit child indices** (`left: i32`, `right: i32`; -1 for leaves). `max_tree_size` is the actual max node count across trees (NOT `2^(max_depth+1) - 1`). `FlatForest.meta: ForestMeta` holds the four `u32` dimensions; `FlatForest` impls `Deref<Target = ForestMeta>` for ergonomic access.
+- `src/gpu/pipeline.rs` — `GpuForest`: uploads `FlatForest` nodes **directly** (already `f32`; zero conversion), compiles WGSL pipelines with device-queried workgroup size, runs batched inference via `predict(&[f32], n_samples) -> Vec<f32>`.
+- `src/gpu/shaders/traverse.wgsl` — 2D dispatch `(ceil(n_samples/wg_size), n_trees, 1)`, one thread per (sample, tree). Uses `u32(node.left)` / `u32(node.right)` for traversal; `max_depth` is the GPU loop safety bound.
 - `src/gpu/shaders/reduce.wgsl` — averages per-tree predictions per sample.
 - Tests: `tests/flat_forest.rs` (CPU, no feature flag), `tests/gpu_inference.rs` (requires GPU, `--features gpu`).
+
+**FlatNode layout (16 bytes, `#[repr(C)]`):**
+```
+left: i32 | right: i32 | feature_index: u32 | value: f32
+```
+`value` is dual-purpose: split threshold for internal nodes, leaf prediction for leaves. `left < 0` is the sole discriminant — no separate `is_leaf` field needed. 16 bytes = exactly 4 nodes per 64-byte cache line. Under `gpu` feature, `FlatNode` and `ForestMeta` derive `bytemuck::Pod + Zeroable`, so nodes upload as `bytemuck::cast_slice::<FlatNode, u8>(&flat.nodes)` with no conversion loop.
+
+**Precision model:**
+- `FlatNode` stores `value: f32`. `FlatForest::predict` casts each feature to `f32` before comparison so that CPU and GPU traversal are identical.
+- `FlatForest::predict` results differ from `RandomForest::predict` (f64) by ~1e-5 due to f32 quantisation of leaf values; use that tolerance in tests.
+- `FlatForest::predict` vs `GpuForest::predict` differ by <1e-5 (only f64 vs f32 accumulation of f32 leaf values).
 
 **GpuForest API (wgpu 28):**
 - `GpuForest::from_flat_forest(flat: &FlatForest, max_samples: usize) -> GpuForest` — creates GPU buffers sized for up to `max_samples` rows. Pre-allocates 4 buffers at init; no per-call VRAM allocation.
@@ -71,6 +82,11 @@ The `MaxFeatures` enum supports multiple feature sampling strategies:
 - Sub-range binding: pass `wgpu::BufferBinding { buffer, offset: 0, size: Some(BufferSize::new(feature_bytes)) }` — this is essential for `arrayLength()` to reflect the actual batch size, not buffer capacity.
 - wgpu 28 poll API: `queue.submit()` returns a `SubmissionIndex`; pass it to `device.poll(PollType::Wait { submission_index: Some(idx), timeout: None })` for per-submission blocking wait.
 - Always call `staging_buffer.unmap()` after reading from a pre-allocated (reused) staging buffer, so the next `encoder.copy_buffer_to_buffer` + map cycle works correctly.
+
+**wgpu 28 pipeline overridable constants (workgroup size):**
+- WGSL: `override wg_size: u32 = 64u;` at top of shader, then `@compute @workgroup_size(wg_size, 1, 1)`. Override expressions are valid in `@workgroup_size`.
+- Rust: `PipelineCompilationOptions { constants: &[("wg_size", value_as_f64)], ..Default::default() }`. The type is `&[(&str, f64)]` — **not** `HashMap<String, f64>` (that was an older wgpu API).
+- Workgroup size heuristic: `device.limits().max_compute_invocations_per_workgroup.min(device.limits().max_compute_workgroup_size_x).min(256)`. Clamp both per-group and per-X-dimension limits; cap at 256 (larger groups rarely help memory-bandwidth-bound kernels). Store result in `GpuForestShared::workgroup_size` and use in `n_samples.div_ceil(shared.workgroup_size)` dispatch.
 
 **Thread safety and TLS on Metal/wgpu:**
 - wgpu/Metal GPU resources held in `thread_local!` cause `"cannot access a Thread Local Storage value during or after destruction: AccessError"` when rayon worker threads tear down, because Metal's OS autorelease pool is destroyed before Rust TLS destructors run.
