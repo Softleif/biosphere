@@ -221,14 +221,7 @@ fn fill_bfs(root: &DecisionTreeNode, nodes: &mut [FlatNode]) {
     let mut next_slot = 1usize;
 
     while let Some((node, idx)) = queue.pop_front() {
-        if node.feature_index.is_none() {
-            nodes[idx] = FlatNode {
-                left: -1,
-                right: -1,
-                feature_index: 0,
-                value: node.label.unwrap() as f32,
-            };
-        } else {
+        if let Some(feature_index) = node.feature_index {
             let left_idx = next_slot;
             next_slot += 1;
             let right_idx = next_slot;
@@ -237,12 +230,19 @@ fn fill_bfs(root: &DecisionTreeNode, nodes: &mut [FlatNode]) {
             nodes[idx] = FlatNode {
                 left: left_idx as i32,
                 right: right_idx as i32,
-                feature_index: node.feature_index.unwrap() as u32,
+                feature_index: feature_index as u32,
                 value: node.feature_value.unwrap() as f32,
             };
 
             queue.push_back((node.left_child.as_ref().unwrap(), left_idx));
             queue.push_back((node.right_child.as_ref().unwrap(), right_idx));
+        } else {
+            nodes[idx] = FlatNode {
+                left: -1,
+                right: -1,
+                feature_index: 0,
+                value: node.label.unwrap() as f32,
+            };
         }
     }
 }
