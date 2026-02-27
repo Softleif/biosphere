@@ -37,8 +37,9 @@ fn flat_forest_matches_recursive() {
     let flat_preds = flat.predict(&test_X.view());
 
     for (i, (cpu, flat)) in cpu_preds.iter().zip(flat_preds.iter()).enumerate() {
+        // FlatForest stores nodes as f32; allow for f32 quantisation error.
         assert!(
-            (cpu - flat).abs() < 1e-12,
+            (cpu - flat).abs() < 1e-5,
             "sample {i}: cpu={cpu}, flat={flat}"
         );
     }
@@ -59,8 +60,9 @@ fn flat_forest_single_sample() {
     let flat = FlatForest::from_forest(&forest, 5);
     let flat_preds = flat.predict(&test_X.view());
 
+    // FlatForest stores nodes as f32; allow for f32 quantisation error.
     assert!(
-        (cpu_preds[0] - flat_preds[0]).abs() < 1e-12,
+        (cpu_preds[0] - flat_preds[0]).abs() < 1e-5,
         "cpu={}, flat={}",
         cpu_preds[0],
         flat_preds[0]
@@ -84,8 +86,9 @@ fn flat_forest_deep_tree() {
     let flat_preds = flat.predict(&test_X.view());
 
     for (i, (cpu, flat)) in cpu_preds.iter().zip(flat_preds.iter()).enumerate() {
+        // FlatForest stores nodes as f32; allow for f32 quantisation error.
         assert!(
-            (cpu - flat).abs() < 1e-12,
+            (cpu - flat).abs() < 1e-5,
             "sample {i}: cpu={cpu}, flat={flat}"
         );
     }

@@ -5,17 +5,19 @@
 //
 // Nodes are stored in BFS visit order with explicit left/right child indices,
 // so trees of any depth and shape are supported without exponential padding.
+// Field layout matches FlatNode in flat_forest.rs exactly (repr(C), all 4-byte
+// fields): left, right, feature_index, threshold, leaf_value.
+// A node is a leaf when left < 0.
 //
 // Dispatch: (ceil(n_samples / 64), n_trees, 1)
 // Workgroup size: (64, 1, 1)
 
 struct Node {
-    feature_index: u32,
-    is_leaf: u32,
-    threshold: f32,
-    leaf_value: f32,
     left: i32,
     right: i32,
+    feature_index: u32,
+    threshold: f32,
+    leaf_value: f32,
 }
 
 struct Meta {
@@ -48,7 +50,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Traverse at most max_depth + 1 steps as a safety bound.
     for (var i: u32 = 0u; i <= forest_meta.max_depth; i = i + 1u) {
         let node = nodes[tree_offset + node_idx];
-        if node.is_leaf == 1u {
+        if node.left < 0 {
             per_tree_preds[tree_id * n_samples + sample_id] = node.leaf_value;
             return;
         }

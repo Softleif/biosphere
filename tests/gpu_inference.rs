@@ -48,9 +48,10 @@ mod gpu_tests {
         let features_f32: Vec<f32> = test_x.iter().map(|&v| v as f32).collect();
         let gpu_preds = gpu_forest.predict(&features_f32, 100);
 
-        // GPU uses f32; allow tolerance for f64→f32 conversion.
+        // Both FlatForest and GpuForest use f32 nodes and f32 comparisons.
+        // The only difference is f64 vs f32 accumulation; tolerance ~1e-5.
         for (i, (cpu, gpu)) in cpu_preds.iter().zip(gpu_preds.iter()).enumerate() {
-            let tol = 1e-4;
+            let tol = 1e-5;
             assert!(
                 ((*cpu as f32) - gpu).abs() < tol,
                 "sample {i}: cpu={cpu}, gpu={gpu}"
@@ -78,7 +79,7 @@ mod gpu_tests {
         let gpu_preds = gpu_forest.predict(&features_f32, 1);
 
         assert!(
-            ((cpu_preds[0] as f32) - gpu_preds[0]).abs() < 1e-4,
+            ((cpu_preds[0] as f32) - gpu_preds[0]).abs() < 1e-5,
             "cpu={}, gpu={}",
             cpu_preds[0],
             gpu_preds[0]

@@ -1,30 +1,6 @@
-use crate::flat_forest::FlatForest;
+use crate::flat_forest::{FlatForest, FlatNode, ForestMeta};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
-
-/// GPU representation of a single node (f32/i32, 24 bytes, bytemuck-compatible).
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct GpuNode {
-    feature_index: u32,
-    is_leaf: u32,
-    threshold: f32,
-    leaf_value: f32,
-    /// Left child index within the tree's node slice, or -1 for leaves.
-    left: i32,
-    /// Right child index within the tree's node slice, or -1 for leaves.
-    right: i32,
-}
-
-/// Forest metadata passed to every shader invocation.
-#[repr(C)]
-#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct ForestMeta {
-    n_trees: u32,
-    n_features: u32,
-    max_tree_size: u32,
-    max_depth: u32,
-}
 
 /// GPU state shared across all [`GpuForest`] instances forked from the same forest.
 ///
@@ -38,12 +14,11 @@ struct GpuForestShared {
     reduce_pipeline: wgpu::ComputePipeline,
     traverse_bgl: wgpu::BindGroupLayout,
     reduce_bgl: wgpu::BindGroupLayout,
-    /// Static buffer holding all tree nodes (f32). Never mutated after upload.
+    /// Static buffer holding all tree nodes. Never mutated after upload.
     node_buffer: wgpu::Buffer,
     /// Static buffer holding forest metadata. Never mutated after upload.
     meta_buffer: wgpu::Buffer,
-    n_trees: u32,
-    n_features: u32,
+    meta: ForestMeta,
 }
 
 /// A submitted GPU inference job awaiting results.
@@ -116,9 +91,8 @@ impl GpuForest {
     /// All GPU inference buffers are pre-allocated at this capacity, so individual
     /// `predict` calls avoid any GPU memory allocation overhead.
     ///
-    /// Node thresholds and leaf values are downcast from f64 to f32.
-    /// This may introduce small numerical differences compared to CPU inference
-    /// for samples whose feature value is very close to a split threshold.
+    /// Node thresholds and leaf values are already `f32` in [`FlatForest`], so
+    /// no precision loss occurs during upload.
     ///
     /// [`predict`]: GpuForest::predict
     pub fn from_flat_forest(flat: &FlatForest, max_samples: usize) -> Self {
@@ -143,35 +117,18 @@ impl GpuForest {
             .expect("Failed to create GPU device");
 
         // --- Static buffers ---
-        let gpu_nodes: Vec<GpuNode> = flat
-            .nodes
-            .iter()
-            .map(|n| GpuNode {
-                feature_index: n.feature_index,
-                // FlatNode no longer carries is_leaf; derive it from left < 0.
-                is_leaf: (n.left < 0) as u32,
-                threshold: n.threshold as f32,
-                leaf_value: n.leaf_value as f32,
-                left: n.left,
-                right: n.right,
-            })
-            .collect();
-
+        // FlatNode is #[repr(C)] + bytemuck::Pod, so we can upload the node slice
+        // directly without any conversion.
         let node_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("biosphere::gpu::nodes"),
-            contents: bytemuck::cast_slice(&gpu_nodes),
+            contents: bytemuck::cast_slice::<FlatNode, u8>(&flat.nodes),
             usage: wgpu::BufferUsages::STORAGE,
         });
 
-        let meta = ForestMeta {
-            n_trees: flat.n_trees as u32,
-            n_features: flat.n_features as u32,
-            max_tree_size: flat.max_tree_size as u32,
-            max_depth: flat.max_depth as u32,
-        };
+        // ForestMeta is #[repr(C)] + bytemuck::Pod; upload directly.
         let meta_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("biosphere::gpu::meta"),
-            contents: bytemuck::bytes_of(&meta),
+            contents: bytemuck::bytes_of(&flat.meta),
             usage: wgpu::BufferUsages::STORAGE,
         });
 
@@ -242,8 +199,7 @@ impl GpuForest {
             reduce_bgl,
             node_buffer,
             meta_buffer,
-            n_trees: flat.n_trees as u32,
-            n_features: flat.n_features as u32,
+            meta: flat.meta,
         });
 
         Self::alloc_buffers(shared, max_samples)
@@ -252,8 +208,8 @@ impl GpuForest {
     /// Allocate the per-instance inference buffers for `max_samples` capacity.
     fn alloc_buffers(shared: Arc<GpuForestShared>, max_samples: usize) -> Self {
         let device = &shared.device;
-        let n_trees = shared.n_trees as usize;
-        let n_features = shared.n_features as usize;
+        let n_trees = shared.meta.n_trees as usize;
+        let n_features = shared.meta.n_features as usize;
 
         let feature_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("biosphere::gpu::features"),
@@ -332,8 +288,8 @@ impl GpuForest {
         let shared = &self.shared;
         let device = &shared.device;
         let queue = &shared.queue;
-        let n_features = shared.n_features as usize;
-        let n_trees = shared.n_trees as usize;
+        let n_features = shared.meta.n_features as usize;
+        let n_trees = shared.meta.n_trees as usize;
 
         let feature_bytes = (n_samples * n_features * size_of::<f32>()) as u64;
         let per_tree_bytes = (n_samples * n_trees * size_of::<f32>()) as u64;
@@ -408,7 +364,7 @@ impl GpuForest {
             cpass.set_pipeline(&shared.traverse_pipeline);
             cpass.set_bind_group(0, &traverse_bg, &[]);
             let x_groups = n_samples.div_ceil(64) as u32;
-            cpass.dispatch_workgroups(x_groups, shared.n_trees, 1);
+            cpass.dispatch_workgroups(x_groups, shared.meta.n_trees, 1);
         }
 
         {

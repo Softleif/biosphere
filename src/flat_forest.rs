@@ -3,6 +3,24 @@ use crate::tree::DecisionTreeNode;
 use ndarray::{Array1, ArrayView2};
 use std::collections::VecDeque;
 
+/// Forest metadata: dimensions shared by CPU and GPU inference.
+///
+/// NOTE: field order and types are significant for binary serde (e.g. postcard)
+/// and for direct GPU upload via bytemuck. Changing them requires a migration step
+/// for any data serialised with an earlier layout.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "gpu", derive(bytemuck::Pod, bytemuck::Zeroable))]
+pub struct ForestMeta {
+    pub n_trees: u32,
+    pub n_features: u32,
+    /// Nodes per tree (all trees are padded to this size).
+    pub max_tree_size: u32,
+    /// Maximum depth across all trees (used as a GPU traversal bound).
+    pub max_depth: u32,
+}
+
 /// A single node in a flat tree stored in BFS visit order.
 ///
 /// Internal nodes use `feature_index`, `threshold`, `left`, and `right`.
@@ -14,21 +32,27 @@ use std::collections::VecDeque;
 /// Field order: traversal-hot fields (`left`, `right`, `feature_index`,
 /// `threshold`) come first, the leaf-only field (`leaf_value`) last.
 /// `is_leaf` was removed — `left < 0` encodes leaf status without redundancy
-/// and without the 3-byte padding hole that `bool` caused before `threshold`.
+/// and without the 4-byte overhead that a separate boolean flag would require.
 ///
-/// NOTE: field order is significant for binary serde (e.g. postcard). If you
-/// need binary compatibility with data serialised before this change, a
-/// migration step is required.
-#[derive(Clone)]
+/// All floating-point values use `f32`, matching the GPU representation.
+/// CPU `predict_one` casts feature values to `f32` before comparison so that
+/// the CPU and GPU traversal paths are identical.
+///
+/// NOTE: field order and types are significant for binary serde (e.g. postcard)
+/// and for direct GPU upload via bytemuck. Changing them requires a migration step
+/// for any data serialised with an earlier layout.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
+#[cfg_attr(feature = "gpu", derive(bytemuck::Pod, bytemuck::Zeroable))]
 pub struct FlatNode {
     /// Index of the left child within the tree's node slice, or -1 for leaves.
     pub left: i32,
     /// Index of the right child within the tree's node slice, or -1 for leaves.
     pub right: i32,
     pub feature_index: u32,
-    pub threshold: f64,
-    pub leaf_value: f64,
+    pub threshold: f32,
+    pub leaf_value: f32,
 }
 
 impl FlatNode {
@@ -60,25 +84,32 @@ impl FlatNode {
 /// forest.fit(&X.view(), &y.view());
 ///
 /// let flat = FlatForest::from_forest(&forest, X.ncols());
-/// let predictions = flat.predict(&X.view()); // identical to forest.predict()
+/// let predictions = flat.predict(&X.view()); // comparable to forest.predict()
 /// ```
 ///
 /// Internally, each tree is stored in BFS order with explicit child indices so
 /// deep, sparse trees (common in practice) don't require exponential padding.
+///
+/// All thresholds and leaf values are stored as `f32`. CPU inference casts
+/// feature values to `f32` before comparison so that split decisions are
+/// identical to GPU inference. Results are accumulated in `f64` and returned
+/// as `f64` for API consistency with [`RandomForest::predict`].
 ///
 /// [`GpuForest::from_flat_forest`]: crate::gpu::GpuForest::from_flat_forest
 /// [`RandomForest`]: crate::RandomForest
 #[derive(Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct FlatForest {
-    /// Flat node array: length = `n_trees * max_tree_size`.
+    /// Flat node array: length = `meta.n_trees * meta.max_tree_size`.
     pub(crate) nodes: Vec<FlatNode>,
-    pub n_trees: usize,
-    pub n_features: usize,
-    /// Nodes per tree (all trees padded to this size).
-    pub max_tree_size: usize,
-    /// Maximum depth across all trees (used as a GPU traversal bound).
-    pub max_depth: usize,
+    pub meta: ForestMeta,
+}
+
+impl std::ops::Deref for FlatForest {
+    type Target = ForestMeta;
+    fn deref(&self) -> &ForestMeta {
+        &self.meta
+    }
 }
 
 impl FlatForest {
@@ -112,16 +143,20 @@ impl FlatForest {
 
         FlatForest {
             nodes,
-            n_trees,
-            n_features,
-            max_tree_size,
-            max_depth,
+            meta: ForestMeta {
+                n_trees: n_trees as u32,
+                n_features: n_features as u32,
+                max_tree_size: max_tree_size as u32,
+                max_depth: max_depth as u32,
+            },
         }
     }
 
     /// Run inference on a batch of samples.
     ///
-    /// Produces the same results as `RandomForest::predict` (mean of per-tree predictions).
+    /// Feature values are cast to `f32` internally so that split decisions are
+    /// identical to GPU inference. The per-tree leaf values (f32) are accumulated
+    /// in f64 and the final mean is returned as `Array1<f64>`.
     ///
     /// The loop order is outer=tree, inner=sample so that each tree's node array
     /// stays warm in L3 cache while all samples are processed against it, rather
@@ -130,7 +165,7 @@ impl FlatForest {
         let n_samples = X.nrows();
         let mut output = Array1::<f64>::zeros(n_samples);
 
-        for tree_idx in 0..self.n_trees {
+        for tree_idx in 0..self.meta.n_trees as usize {
             for sample in 0..n_samples {
                 let row = X.row(sample);
                 let features = row.as_slice().expect("feature row must be contiguous");
@@ -138,18 +173,19 @@ impl FlatForest {
             }
         }
 
-        output / self.n_trees as f64
+        output / self.meta.n_trees as f64
     }
 
     fn predict_one(&self, tree_idx: usize, features: &[f64]) -> f64 {
-        let offset = tree_idx * self.max_tree_size;
+        let offset = tree_idx * self.meta.max_tree_size as usize;
         let mut idx = 0usize;
-        for _ in 0..self.max_tree_size {
+        for _ in 0..self.meta.max_tree_size as usize {
             let node = &self.nodes[offset + idx];
             if node.left < 0 {
-                return node.leaf_value;
+                return node.leaf_value as f64;
             }
-            if features[node.feature_index as usize] < node.threshold {
+            // Cast feature to f32 to match GPU traversal exactly.
+            if (features[node.feature_index as usize] as f32) < node.threshold {
                 idx = node.left as usize;
             } else {
                 idx = node.right as usize;
@@ -157,7 +193,7 @@ impl FlatForest {
         }
         panic!(
             "predict_one: traversal exceeded max_tree_size ({}); tree may be malformed",
-            self.max_tree_size
+            self.meta.max_tree_size
         );
     }
 }
@@ -196,7 +232,7 @@ fn fill_bfs(root: &DecisionTreeNode, nodes: &mut [FlatNode]) {
                 right: -1,
                 feature_index: 0,
                 threshold: 0.0,
-                leaf_value: node.label.unwrap(),
+                leaf_value: node.label.unwrap() as f32,
             };
         } else {
             let left_idx = next_slot;
@@ -208,7 +244,7 @@ fn fill_bfs(root: &DecisionTreeNode, nodes: &mut [FlatNode]) {
                 left: left_idx as i32,
                 right: right_idx as i32,
                 feature_index: node.feature_index.unwrap() as u32,
-                threshold: node.feature_value.unwrap(),
+                threshold: node.feature_value.unwrap() as f32,
                 leaf_value: 0.0,
             };
 

@@ -28,7 +28,7 @@
 
 // Allow capital X for arrays.
 #![allow(non_snake_case)]
-pub use flat_forest::{FlatForest, FlatNode};
+pub use flat_forest::{FlatForest, FlatNode, ForestMeta};
 pub use forest::RandomForest;
 pub use forest::RandomForestParameters;
 pub use tree::{DecisionTree, DecisionTreeParameters, MaxFeatures};

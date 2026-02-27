@@ -36,7 +36,7 @@
 //! # Data flow
 //!
 //! ```text
-//! RandomForest  ──from_forest──►  FlatForest (f64, CPU)
+//! RandomForest  ──from_forest──►  FlatForest (f32 nodes, CPU)
 //!                                      │
 //!                              from_flat_forest
 //!                                      │
@@ -61,13 +61,17 @@
 //!
 //! # Precision
 //!
-//! [`FlatForest`] stores thresholds and leaf values as `f64` and produces
-//! results identical to [`RandomForest::predict`].
-//!
-//! [`GpuForest`] converts those values to `f32` on upload. For samples whose
-//! feature value falls very close to a split threshold the GPU prediction may
-//! differ slightly from the CPU prediction. In practice the difference is
+//! [`FlatForest`] stores thresholds and leaf values as `f32`. CPU inference
+//! casts feature values to `f32` before comparison so that split decisions are
+//! identical to GPU inference. Results may differ slightly from
+//! [`RandomForest::predict`] (which uses `f64` throughout); the difference is
 //! within normal f32 rounding error (~1 × 10⁻⁷ relative).
+//!
+//! Because both [`FlatForest::predict`] and [`GpuForest::predict`] use `f32`
+//! comparisons, their predictions agree very closely. The only remaining
+//! difference is that `FlatForest` accumulates leaf values in `f64` while the
+//! GPU shader accumulates in `f32`; this contributes at most ~n_trees × 10⁻⁷
+//! additional error.
 //!
 //! [`FlatForest`]: crate::FlatForest
 //! [`RandomForest::predict`]: crate::RandomForest::predict
