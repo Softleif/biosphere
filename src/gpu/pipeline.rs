@@ -45,7 +45,10 @@ impl GpuInitError {
         } else {
             format!("GPU device creation failed: {e}")
         };
-        Self { message, source: Some(e) }
+        Self {
+            message,
+            source: Some(e),
+        }
     }
 
     /// Returns a step-by-step checklist for resolving GPU initialization
@@ -457,10 +460,7 @@ impl GpuForest {
     /// no precision loss occurs during upload.
     ///
     /// [`predict`]: GpuForest::predict
-    pub fn from_flat_forest(
-        flat: &FlatForest,
-        max_samples: usize,
-    ) -> Result<Self, GpuInitError> {
+    pub fn from_flat_forest(flat: &FlatForest, max_samples: usize) -> Result<Self, GpuInitError> {
         let ctx = GpuContext::new()?;
         Ok(Self::with_context(ctx, flat, max_samples))
     }
