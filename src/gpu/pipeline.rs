@@ -6,7 +6,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use wgpu::util::DeviceExt;
 
-/// Error returned by [`GpuForest::from_flat_forest`].
+// ---------------------------------------------------------------------------
+// GpuInitError
+// ---------------------------------------------------------------------------
+
+/// Error returned by [`GpuContext::new`] and [`GpuForest::from_flat_forest`].
 ///
 /// Call [`GpuInitError::hints`] for a step-by-step checklist that covers the
 /// most common causes of GPU initialization failures in headless / HPC / SLURM
@@ -74,23 +78,26 @@ impl std::error::Error for GpuInitError {
     }
 }
 
-/// GPU state shared across all [`GpuForest`] instances forked from the same forest.
+// ---------------------------------------------------------------------------
+// GpuContext
+// ---------------------------------------------------------------------------
+
+/// A shareable GPU device context: wgpu device, queue, and compiled compute
+/// pipelines.
 ///
-/// Holds the GPU device, compiled pipelines, and static node/meta buffers.
-/// Wrapped in [`Arc`] so [`GpuForest::fork`] avoids re-uploading node data or
-/// recompiling shaders when creating per-thread handles.
-struct GpuForestShared {
+/// Create once with [`GpuContext::new`] and pass the returned `Arc<GpuContext>`
+/// to multiple [`GpuForest::with_context`] calls to avoid redundant GPU
+/// initialisation and shader recompilation across forests.
+///
+/// When you only have a single forest, [`GpuForest::from_flat_forest`] creates
+/// a context internally and is simpler to use.
+pub struct GpuContext {
     device: wgpu::Device,
     queue: wgpu::Queue,
     traverse_pipeline: wgpu::ComputePipeline,
     reduce_pipeline: wgpu::ComputePipeline,
     traverse_bgl: wgpu::BindGroupLayout,
     reduce_bgl: wgpu::BindGroupLayout,
-    /// Static buffer holding all tree nodes. Never mutated after upload.
-    node_buffer: wgpu::Buffer,
-    /// Static buffer holding forest metadata. Never mutated after upload.
-    meta_buffer: wgpu::Buffer,
-    meta: ForestMeta,
     /// Workgroup size chosen from device limits at pipeline-compile time.
     workgroup_size: u32,
     /// True when the adapter supports `MAPPABLE_PRIMARY_BUFFERS` (Apple Silicon,
@@ -100,141 +107,24 @@ struct GpuForestShared {
     uma: bool,
 }
 
-/// A submitted GPU inference job awaiting results.
-///
-/// Created by [`GpuForest::predict_submit`]. Call [`PredictHandle::collect`] to
-/// wait for the GPU to finish and retrieve the predictions.
-///
-/// Submitting multiple handles before calling `collect` on any of them lets the
-/// GPU execute the underlying work concurrently.
-pub struct PredictHandle<'forest> {
-    forest: &'forest GpuForest,
-    submit_idx: wgpu::SubmissionIndex,
-    output_bytes: u64,
-}
-
-impl<'forest> PredictHandle<'forest> {
-    /// Block until the GPU finishes this submission and return the predictions.
+impl GpuContext {
+    /// Initialise a GPU device and compile the compute pipelines.
     ///
-    /// One `f32` per sample, in the same order as the input to [`GpuForest::predict_submit`].
+    /// Selects the highest-performance available adapter. Returns an
+    /// `Arc<GpuContext>` that can be passed to any number of
+    /// [`GpuForest::with_context`] calls.
     ///
-    /// Panics if the GPU does not complete within the timeout configured via
-    /// [`GpuForest::with_collect_timeout`] (default: 10 seconds).
-    pub fn collect(self) -> Array1<f32> {
-        let device = &self.forest.shared.device;
-        let timeout = self.forest.collect_timeout;
-
-        let result = if self.forest.shared.uma {
-            // UMA path: output_buffer has MAP_READ usage, so we read directly
-            // without a staging copy. The poll also waits for the GPU submission.
-            let slice = self.forest.output_buffer.slice(..self.output_bytes);
-            slice.map_async(wgpu::MapMode::Read, |r| {
-                r.expect("GPU output buffer mapping failed");
-            });
-            device
-                .poll(wgpu::PollType::Wait {
-                    submission_index: Some(self.submit_idx),
-                    timeout: Some(timeout),
-                })
-                .expect("GPU timed out during inference; consider increasing the timeout with GpuForest::with_collect_timeout");
-            let data = slice.get_mapped_range();
-            let result = Array1::from(bytemuck::cast_slice::<u8, f32>(&data).to_vec());
-            drop(data);
-            self.forest.output_buffer.unmap();
-            result
-        } else {
-            // Discrete GPU path: results were copied to the staging buffer by the
-            // command encoder; map that and read back.
-            let staging = self.forest.staging_buffer.as_ref().unwrap();
-            let buffer_slice = staging.slice(..self.output_bytes);
-            buffer_slice.map_async(wgpu::MapMode::Read, |result| {
-                result.expect("GPU staging buffer mapping failed");
-            });
-            device
-                .poll(wgpu::PollType::Wait {
-                    submission_index: Some(self.submit_idx),
-                    timeout: Some(timeout),
-                })
-                .expect("GPU timed out during inference; consider increasing the timeout with GpuForest::with_collect_timeout");
-            let data = buffer_slice.get_mapped_range();
-            let result = Array1::from(bytemuck::cast_slice::<u8, f32>(&data).to_vec());
-            drop(data);
-            staging.unmap();
-            result
-        };
-
-        // Release the busy flag so predict_submit can be called again.
-        self.forest.busy.store(false, Ordering::Release);
-        result
-    }
-}
-
-/// A random forest loaded onto the GPU for batched inference.
-///
-/// Create with [`GpuForest::from_flat_forest`], then call [`GpuForest::predict`].
-///
-/// Use [`GpuForest::fork`] to create per-thread handles that share compiled
-/// pipelines and uploaded node data without re-uploading or recompiling.
-/// Each handle has its own pre-allocated GPU inference buffers and is safe
-/// to use from a single thread concurrently with other handles forked from
-/// the same forest.
-pub struct GpuForest {
-    shared: Arc<GpuForestShared>,
-    /// Pre-allocated feature buffer.
-    /// UMA: `STORAGE | MAP_WRITE` — CPU writes directly via mapping.
-    /// Discrete: `STORAGE | COPY_DST` — written via `queue.write_buffer`.
-    /// Sized for `max_samples * n_features * 4` bytes.
-    feature_buffer: wgpu::Buffer,
-    /// Pre-allocated intermediate per-tree predictions (STORAGE).
-    /// Sized for `max_samples * n_trees * 4` bytes.
-    per_tree_preds_buffer: wgpu::Buffer,
-    /// Pre-allocated final per-sample means.
-    /// UMA: `STORAGE | MAP_READ` — CPU reads directly; no staging copy needed.
-    /// Discrete: `STORAGE | COPY_SRC` — copied to staging buffer before readback.
-    /// Sized for `max_samples * 4` bytes.
-    output_buffer: wgpu::Buffer,
-    /// CPU-readable staging buffer for discrete GPUs. `None` on UMA devices.
-    /// Discrete: `COPY_DST | MAP_READ`, sized for `max_samples * 4` bytes.
-    staging_buffer: Option<wgpu::Buffer>,
-    max_samples: usize,
-    /// Maximum time [`PredictHandle::collect`] will wait for the GPU.
-    /// Default: 10 seconds.
-    collect_timeout: Duration,
-    /// Set to `true` while a [`PredictHandle`] is outstanding. Guards against
-    /// calling [`predict_submit`] again before the previous handle is collected,
-    /// which would overwrite the feature buffer while the GPU may still read it.
+    /// # Errors
     ///
-    /// [`predict_submit`]: GpuForest::predict_submit
-    busy: AtomicBool,
-}
-
-impl GpuForest {
-    /// Upload a [`FlatForest`] to the GPU and compile the compute pipelines.
-    ///
-    /// `max_samples` is the maximum batch size for a single [`predict`] call.
-    /// All GPU inference buffers are pre-allocated at this capacity, so individual
-    /// `predict` calls avoid any GPU memory allocation overhead.
-    ///
-    /// On Apple Silicon and other unified-memory adapters, feature upload and
-    /// output readback use direct buffer mapping instead of staging copies,
-    /// eliminating redundant data movement within the shared memory pool.
-    ///
-    /// Node thresholds and leaf values are already `f32` in [`FlatForest`], so
-    /// no precision loss occurs during upload.
-    ///
-    /// [`predict`]: GpuForest::predict
-    pub fn from_flat_forest(
-        flat: &FlatForest,
-        max_samples: usize,
-    ) -> Result<Self, GpuInitError> {
-        pollster::block_on(Self::from_flat_forest_async(flat, max_samples))
+    /// Returns [`GpuInitError`] if no suitable adapter is found or the device
+    /// cannot be created. Call [`GpuInitError::hints`] for an HPC/SLURM
+    /// troubleshooting checklist.
+    pub fn new() -> Result<Arc<Self>, GpuInitError> {
+        pollster::block_on(Self::new_async())
     }
 
-    async fn from_flat_forest_async(
-        flat: &FlatForest,
-        max_samples: usize,
-    ) -> Result<Self, GpuInitError> {
-        // --- Device initialisation ---
+    async fn new_async() -> Result<Arc<Self>, GpuInitError> {
+        // --- Adapter ---
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -264,22 +154,6 @@ impl GpuForest {
             })
             .await
             .map_err(GpuInitError::device_creation)?;
-
-        // --- Static buffers ---
-        // FlatNode is #[repr(C)] + bytemuck::Pod, so we can upload the node slice
-        // directly without any conversion.
-        let node_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("biosphere::gpu::nodes"),
-            contents: bytemuck::cast_slice::<FlatNode, u8>(&flat.nodes),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-
-        // ForestMeta is #[repr(C)] + bytemuck::Pod; upload directly.
-        let meta_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("biosphere::gpu::meta"),
-            contents: bytemuck::bytes_of(&flat.meta),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
 
         // --- Bind group layouts ---
         let traverse_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -356,29 +230,247 @@ impl GpuForest {
             cache: None,
         });
 
-        let shared = Arc::new(GpuForestShared {
+        Ok(Arc::new(GpuContext {
             device,
             queue,
             traverse_pipeline,
             reduce_pipeline,
             traverse_bgl,
             reduce_bgl,
+            workgroup_size,
+            uma,
+        }))
+    }
+
+    /// Returns `true` if the underlying adapter is a unified-memory device
+    /// (Apple Silicon, Vulkan UMA, DX12 UMA).
+    ///
+    /// On UMA devices, feature upload and output readback use direct buffer
+    /// mapping instead of staging copies, reducing memory bandwidth usage.
+    pub fn is_uma(&self) -> bool {
+        self.uma
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GpuForestShared / GpuForest / PredictHandle
+// ---------------------------------------------------------------------------
+
+/// Per-forest GPU state shared across all [`GpuForest`] instances forked from
+/// the same forest.
+///
+/// Holds the static per-forest node/meta buffers and a reference to the
+/// [`GpuContext`] (device, pipelines). Wrapped in [`Arc`] so
+/// [`GpuForest::fork`] avoids re-uploading node data when creating per-thread
+/// handles.
+struct GpuForestShared {
+    /// Shared device, queue, and compiled pipelines.
+    ctx: Arc<GpuContext>,
+    /// Static buffer holding all tree nodes. Never mutated after upload.
+    node_buffer: wgpu::Buffer,
+    /// Static buffer holding forest metadata. Never mutated after upload.
+    meta_buffer: wgpu::Buffer,
+    meta: ForestMeta,
+}
+
+/// A submitted GPU inference job awaiting results.
+///
+/// Created by [`GpuForest::predict_submit`]. Call [`PredictHandle::collect`] to
+/// wait for the GPU to finish and retrieve the predictions.
+///
+/// Submitting multiple handles before calling `collect` on any of them lets the
+/// GPU execute the underlying work concurrently.
+pub struct PredictHandle<'forest> {
+    forest: &'forest GpuForest,
+    submit_idx: wgpu::SubmissionIndex,
+    output_bytes: u64,
+}
+
+impl<'forest> PredictHandle<'forest> {
+    /// Block until the GPU finishes this submission and return the predictions.
+    ///
+    /// One `f32` per sample, in the same order as the input to [`GpuForest::predict_submit`].
+    ///
+    /// Panics if the GPU does not complete within the timeout configured via
+    /// [`GpuForest::with_collect_timeout`] (default: 10 seconds).
+    pub fn collect(self) -> Array1<f32> {
+        let device = &self.forest.shared.ctx.device;
+        let timeout = self.forest.collect_timeout;
+
+        let result = if self.forest.shared.ctx.uma {
+            // UMA path: output_buffer has MAP_READ usage, so we read directly
+            // without a staging copy. The poll also waits for the GPU submission.
+            let slice = self.forest.output_buffer.slice(..self.output_bytes);
+            slice.map_async(wgpu::MapMode::Read, |r| {
+                r.expect("GPU output buffer mapping failed");
+            });
+            device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: Some(self.submit_idx),
+                    timeout: Some(timeout),
+                })
+                .expect("GPU timed out during inference; consider increasing the timeout with GpuForest::with_collect_timeout");
+            let data = slice.get_mapped_range();
+            let result = Array1::from(bytemuck::cast_slice::<u8, f32>(&data).to_vec());
+            drop(data);
+            self.forest.output_buffer.unmap();
+            result
+        } else {
+            // Discrete GPU path: results were copied to the staging buffer by the
+            // command encoder; map that and read back.
+            let staging = self.forest.staging_buffer.as_ref().unwrap();
+            let buffer_slice = staging.slice(..self.output_bytes);
+            buffer_slice.map_async(wgpu::MapMode::Read, |result| {
+                result.expect("GPU staging buffer mapping failed");
+            });
+            device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: Some(self.submit_idx),
+                    timeout: Some(timeout),
+                })
+                .expect("GPU timed out during inference; consider increasing the timeout with GpuForest::with_collect_timeout");
+            let data = buffer_slice.get_mapped_range();
+            let result = Array1::from(bytemuck::cast_slice::<u8, f32>(&data).to_vec());
+            drop(data);
+            staging.unmap();
+            result
+        };
+
+        // Release the busy flag so predict_submit can be called again.
+        self.forest.busy.store(false, Ordering::Release);
+        result
+    }
+}
+
+/// A random forest loaded onto the GPU for batched inference.
+///
+/// Create with [`GpuForest::from_flat_forest`] (single forest) or
+/// [`GpuForest::with_context`] (multiple forests sharing a device), then call
+/// [`GpuForest::predict`].
+///
+/// Use [`GpuForest::fork`] to create per-thread handles that share compiled
+/// pipelines and uploaded node data without re-uploading or recompiling.
+/// Each handle has its own pre-allocated GPU inference buffers and is safe
+/// to use from a single thread concurrently with other handles forked from
+/// the same forest.
+pub struct GpuForest {
+    shared: Arc<GpuForestShared>,
+    /// Pre-allocated feature buffer.
+    /// UMA: `STORAGE | MAP_WRITE` — CPU writes directly via mapping.
+    /// Discrete: `STORAGE | COPY_DST` — written via `queue.write_buffer`.
+    /// Sized for `max_samples * n_features * 4` bytes.
+    feature_buffer: wgpu::Buffer,
+    /// Pre-allocated intermediate per-tree predictions (STORAGE).
+    /// Sized for `max_samples * n_trees * 4` bytes.
+    per_tree_preds_buffer: wgpu::Buffer,
+    /// Pre-allocated final per-sample means.
+    /// UMA: `STORAGE | MAP_READ` — CPU reads directly; no staging copy needed.
+    /// Discrete: `STORAGE | COPY_SRC` — copied to staging buffer before readback.
+    /// Sized for `max_samples * 4` bytes.
+    output_buffer: wgpu::Buffer,
+    /// CPU-readable staging buffer for discrete GPUs. `None` on UMA devices.
+    /// Discrete: `COPY_DST | MAP_READ`, sized for `max_samples * 4` bytes.
+    staging_buffer: Option<wgpu::Buffer>,
+    max_samples: usize,
+    /// Maximum time [`PredictHandle::collect`] will wait for the GPU.
+    /// Default: 10 seconds.
+    collect_timeout: Duration,
+    /// Set to `true` while a [`PredictHandle`] is outstanding. Guards against
+    /// calling [`predict_submit`] again before the previous handle is collected,
+    /// which would overwrite the feature buffer while the GPU may still read it.
+    ///
+    /// [`predict_submit`]: GpuForest::predict_submit
+    busy: AtomicBool,
+}
+
+impl GpuForest {
+    /// Upload a [`FlatForest`] to the GPU using a pre-initialised [`GpuContext`].
+    ///
+    /// Reuses the device, queue, and compiled compute pipelines from `ctx`,
+    /// avoiding redundant GPU initialisation and shader recompilation. Only the
+    /// per-forest node/meta buffers and per-instance inference buffers (sized for
+    /// `max_samples`) are newly allocated.
+    ///
+    /// This is the preferred constructor when serving multiple forests at
+    /// inference time.
+    ///
+    /// ```rust,no_run
+    /// # use biosphere::{FlatForest, RandomForest, RandomForestParameters};
+    /// # use biosphere::gpu::{GpuContext, GpuForest};
+    /// # use ndarray::Array2;
+    /// # let (flat_a, flat_b) = {
+    /// #     let make = |seed| {
+    /// #         let mut f = RandomForest::new(RandomForestParameters::default().with_seed(seed));
+    /// #         f.fit(&Array2::<f64>::zeros((2,1)).view(), &ndarray::Array1::zeros(2).view());
+    /// #         FlatForest::from_forest(&f, 1)
+    /// #     };
+    /// #     (make(1), make(2))
+    /// # };
+    /// let ctx = GpuContext::new().unwrap();
+    /// let forest_a = GpuForest::with_context(ctx.clone(), &flat_a, 1024);
+    /// let forest_b = GpuForest::with_context(ctx.clone(), &flat_b, 2048);
+    /// ```
+    pub fn with_context(ctx: Arc<GpuContext>, flat: &FlatForest, max_samples: usize) -> Self {
+        let device = &ctx.device;
+
+        // FlatNode is #[repr(C)] + bytemuck::Pod, so we can upload the node slice
+        // directly without any conversion.
+        let node_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("biosphere::gpu::nodes"),
+            contents: bytemuck::cast_slice::<FlatNode, u8>(&flat.nodes),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        // ForestMeta is #[repr(C)] + bytemuck::Pod; upload directly.
+        let meta_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("biosphere::gpu::meta"),
+            contents: bytemuck::bytes_of(&flat.meta),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        let shared = Arc::new(GpuForestShared {
+            ctx,
             node_buffer,
             meta_buffer,
             meta: flat.meta,
-            workgroup_size,
-            uma,
         });
 
-        Ok(Self::alloc_buffers(shared, max_samples))
+        Self::alloc_buffers(shared, max_samples)
+    }
+
+    /// Upload a [`FlatForest`] to the GPU and compile the compute pipelines.
+    ///
+    /// `max_samples` is the maximum batch size for a single [`predict`] call.
+    /// All GPU inference buffers are pre-allocated at this capacity, so
+    /// individual `predict` calls avoid any GPU memory allocation overhead.
+    ///
+    /// This convenience constructor initialises a private [`GpuContext`]
+    /// internally. When creating **multiple forests**, prefer [`GpuContext::new`]
+    /// once and then [`GpuForest::with_context`] for each forest so the device
+    /// and compiled pipelines are shared.
+    ///
+    /// On Apple Silicon and other unified-memory adapters, feature upload and
+    /// output readback use direct buffer mapping instead of staging copies,
+    /// eliminating redundant data movement within the shared memory pool.
+    ///
+    /// Node thresholds and leaf values are already `f32` in [`FlatForest`], so
+    /// no precision loss occurs during upload.
+    ///
+    /// [`predict`]: GpuForest::predict
+    pub fn from_flat_forest(
+        flat: &FlatForest,
+        max_samples: usize,
+    ) -> Result<Self, GpuInitError> {
+        let ctx = GpuContext::new()?;
+        Ok(Self::with_context(ctx, flat, max_samples))
     }
 
     /// Allocate the per-instance inference buffers for `max_samples` capacity.
     fn alloc_buffers(shared: Arc<GpuForestShared>, max_samples: usize) -> Self {
-        let device = &shared.device;
+        let device = &shared.ctx.device;
         let n_trees = shared.meta.n_trees as usize;
         let n_features = shared.meta.n_features as usize;
-        let uma = shared.uma;
+        let uma = shared.ctx.uma;
 
         let feature_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("biosphere::gpu::features"),
@@ -482,7 +574,7 @@ impl GpuForest {
     /// On UMA devices, feature upload and output readback use direct buffer
     /// mapping instead of staging copies, reducing memory bandwidth usage.
     pub fn is_uma(&self) -> bool {
-        self.shared.uma
+        self.shared.ctx.uma
     }
 
     /// Submit a batch inference job to the GPU and return a handle to collect results later.
@@ -534,15 +626,16 @@ impl GpuForest {
             .expect("standard layout is always contiguous");
 
         let shared = &self.shared;
-        let device = &shared.device;
-        let queue = &shared.queue;
+        let ctx = &shared.ctx;
+        let device = &ctx.device;
+        let queue = &ctx.queue;
         let n_trees = shared.meta.n_trees as usize;
 
         let feature_bytes = (n_samples * n_features * size_of::<f32>()) as u64;
         let per_tree_bytes = (n_samples * n_trees * size_of::<f32>()) as u64;
         let output_bytes = (n_samples * size_of::<f32>()) as u64;
 
-        if shared.uma {
+        if ctx.uma {
             // UMA path: map feature_buffer directly and write without a staging blit.
             // The buffer is guaranteed to be free here (enforced by the busy flag above).
             // Use a bounded 1-second timeout to detect wgpu validation errors that would
@@ -573,7 +666,7 @@ impl GpuForest {
         // the actual n_samples, not the full max_samples capacity.
         let traverse_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
-            layout: &shared.traverse_bgl,
+            layout: &ctx.traverse_bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -604,7 +697,7 @@ impl GpuForest {
 
         let reduce_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
-            layout: &shared.reduce_bgl,
+            layout: &ctx.reduce_bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -633,9 +726,9 @@ impl GpuForest {
                 label: Some("biosphere::gpu::traverse_pass"),
                 timestamp_writes: None,
             });
-            cpass.set_pipeline(&shared.traverse_pipeline);
+            cpass.set_pipeline(&ctx.traverse_pipeline);
             cpass.set_bind_group(0, &traverse_bg, &[]);
-            let x_groups = n_samples.div_ceil(shared.workgroup_size as usize) as u32;
+            let x_groups = n_samples.div_ceil(ctx.workgroup_size as usize) as u32;
             cpass.dispatch_workgroups(x_groups, shared.meta.n_trees, 1);
         }
 
@@ -644,13 +737,13 @@ impl GpuForest {
                 label: Some("biosphere::gpu::reduce_pass"),
                 timestamp_writes: None,
             });
-            cpass.set_pipeline(&shared.reduce_pipeline);
+            cpass.set_pipeline(&ctx.reduce_pipeline);
             cpass.set_bind_group(0, &reduce_bg, &[]);
-            let x_groups = n_samples.div_ceil(shared.workgroup_size as usize) as u32;
+            let x_groups = n_samples.div_ceil(ctx.workgroup_size as usize) as u32;
             cpass.dispatch_workgroups(x_groups, 1, 1);
         }
 
-        if !shared.uma {
+        if !ctx.uma {
             // Discrete GPU: copy output to the staging buffer so the CPU can read it.
             encoder.copy_buffer_to_buffer(
                 &self.output_buffer,
@@ -689,7 +782,9 @@ impl GpuForest {
     }
 }
 
-// --- Helpers ---
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 fn storage_ro_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {

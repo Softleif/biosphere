@@ -3,7 +3,7 @@
 //! Enabled with the `gpu` feature flag. Uses [wgpu] compute shaders (Vulkan,
 //! Metal, DX12, WebGPU) with no platform-specific code.
 //!
-//! # Quick start
+//! # Quick start — single forest
 //!
 //! ```rust,no_run
 //! use biosphere::{FlatForest, RandomForest, RandomForestParameters};
@@ -18,7 +18,7 @@
 //! let mut forest = RandomForest::new(RandomForestParameters::default());
 //! forest.fit(&X.view(), &y.view());
 //!
-//! // 2. Convert to a flat BFS representation (works on CPU too).
+//! // 2. Convert to a flat representation (works on CPU too).
 //! let n_features = X.ncols();
 //! let flat = FlatForest::from_forest(&forest, n_features);
 //!
@@ -32,12 +32,39 @@
 //! let predictions: ndarray::Array1<f32> = gpu_forest.predict(&test_X_f32.view());
 //! ```
 //!
+//! # Multiple forests — shared device
+//!
+//! When serving several forests, initialise a [`GpuContext`] once and pass it
+//! to each [`GpuForest::with_context`] call. This reuses the GPU device and
+//! compiled compute pipelines, avoiding redundant initialisation overhead.
+//!
+//! ```rust,no_run
+//! use biosphere::{FlatForest, RandomForest, RandomForestParameters};
+//! use biosphere::gpu::{GpuContext, GpuForest};
+//! use ndarray::Array2;
+//!
+//! # let make_flat = |seed| {
+//! #     let mut f = RandomForest::new(RandomForestParameters::default().with_seed(seed));
+//! #     f.fit(&Array2::<f64>::zeros((2, 1)).view(), &ndarray::Array1::zeros(2).view());
+//! #     FlatForest::from_forest(&f, 1)
+//! # };
+//! # let flat_a = make_flat(1);
+//! # let flat_b = make_flat(2);
+//! // Initialise device + compile shaders once.
+//! let ctx = GpuContext::new().unwrap();
+//!
+//! // Each forest gets its own node/meta buffers and inference buffers,
+//! // but shares the device, queue, and pipelines.
+//! let forest_a = GpuForest::with_context(ctx.clone(), &flat_a, 1024);
+//! let forest_b = GpuForest::with_context(ctx.clone(), &flat_b, 2048);
+//! ```
+//!
 //! # Data flow
 //!
 //! ```text
 //! RandomForest  ──from_forest──►  FlatForest (f32 nodes, CPU)
 //!                                      │
-//!                              from_flat_forest
+//!                         from_flat_forest / with_context
 //!                                      │
 //!                                      ▼
 //!                               GpuForest (f32, GPU)
@@ -117,4 +144,4 @@
 //! [`RandomForest::predict`]: crate::RandomForest::predict
 
 mod pipeline;
-pub use pipeline::{GpuForest, GpuInitError, PredictHandle};
+pub use pipeline::{GpuContext, GpuForest, GpuInitError, PredictHandle};
