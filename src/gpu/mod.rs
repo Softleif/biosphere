@@ -23,7 +23,7 @@
 //! let flat = FlatForest::from_forest(&forest, n_features);
 //!
 //! // 3. Upload to the GPU, reserving capacity for up to 1024 samples per call.
-//! let gpu_forest = GpuForest::from_flat_forest(&flat, 1024);
+//! let gpu_forest = GpuForest::from_flat_forest(&flat, 1024).unwrap();
 //!
 //! // 4. Run inference. Features must be f32 (cast from f64 if needed).
 //! let test_X: Array2<f64> = /* ... your test data ... */
@@ -76,7 +76,7 @@
 //! #        f.fit(&Array2::<f64>::zeros((2,2)).view(), &ndarray::Array1::zeros(2).view()); f },
 //! #     2);
 //! // Two handles sharing compiled pipelines and uploaded node data.
-//! let forest_a = GpuForest::from_flat_forest(&flat, 1024);
+//! let forest_a = GpuForest::from_flat_forest(&flat, 1024).unwrap();
 //! let forest_b = forest_a.fork(1024);
 //!
 //! let batch_a: Array2<f32> = /* ... first batch ... */
@@ -117,4 +117,4 @@
 //! [`RandomForest::predict`]: crate::RandomForest::predict
 
 mod pipeline;
-pub use pipeline::{GpuForest, PredictHandle};
+pub use pipeline::{GpuForest, GpuInitError, PredictHandle};

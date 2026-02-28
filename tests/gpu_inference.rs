@@ -45,7 +45,7 @@ mod gpu_tests {
         let test_x_f32 = test_x.mapv(|v| v as f32);
         let cpu_preds = flat.predict(&test_x_f32.view());
 
-        let gpu_forest = GpuForest::from_flat_forest(&flat, 100);
+        let gpu_forest = GpuForest::from_flat_forest(&flat, 100).unwrap();
         let gpu_preds = gpu_forest.predict(&test_x_f32.view());
 
         // Both FlatForest and GpuForest use f32 nodes and f32 comparisons.
@@ -75,7 +75,7 @@ mod gpu_tests {
         let test_x_f32 = test_x.mapv(|v| v as f32);
         let cpu_preds = flat.predict(&test_x_f32.view());
 
-        let gpu_forest = GpuForest::from_flat_forest(&flat, 1);
+        let gpu_forest = GpuForest::from_flat_forest(&flat, 1).unwrap();
         let gpu_preds = gpu_forest.predict(&test_x_f32.view());
 
         assert!(
@@ -102,7 +102,7 @@ mod gpu_tests {
 
         let flat = FlatForest::from_forest(&forest, n_features);
         // Allocate enough capacity for the largest batch we'll test.
-        let gpu_forest = GpuForest::from_flat_forest(&flat, 200);
+        let gpu_forest = GpuForest::from_flat_forest(&flat, 200).unwrap();
 
         for &n_samples in &[1usize, 63, 64, 65, 127, 128, 129] {
             let (test_x, _) = make_data(n_samples, n_features, n_samples as u64 + 100);
@@ -139,7 +139,7 @@ mod gpu_tests {
         forest.fit(&train_x.view(), &train_y.view());
 
         let flat = FlatForest::from_forest(&forest, n_features);
-        let gpu_forest = GpuForest::from_flat_forest(&flat, 100);
+        let gpu_forest = GpuForest::from_flat_forest(&flat, 100).unwrap();
 
         let (test_x1, _) = make_data(80, n_features, 10);
         let (test_x2, _) = make_data(60, n_features, 20);
@@ -184,7 +184,7 @@ mod gpu_tests {
         let test_x_f32 = test_x.mapv(|v| v as f32);
 
         let cpu_preds = flat.predict(&test_x_f32.view());
-        let gpu_forest = GpuForest::from_flat_forest(&flat, 50);
+        let gpu_forest = GpuForest::from_flat_forest(&flat, 50).unwrap();
         let gpu_preds = gpu_forest.predict(&test_x_f32.view());
 
         for (i, (cpu, gpu)) in cpu_preds.iter().zip(gpu_preds.iter()).enumerate() {
@@ -209,7 +209,7 @@ mod gpu_tests {
         forest.fit(&train_x.view(), &train_y.view());
 
         let flat = FlatForest::from_forest(&forest, n_features);
-        let gpu_forest = GpuForest::from_flat_forest(&flat, 10);
+        let gpu_forest = GpuForest::from_flat_forest(&flat, 10).unwrap();
 
         // Just ensure it's callable; the value is adapter-dependent.
         let _uma: bool = gpu_forest.is_uma();
@@ -229,6 +229,7 @@ mod gpu_tests {
 
         let flat = FlatForest::from_forest(&forest, n_features);
         let gpu_forest = GpuForest::from_flat_forest(&flat, 50)
+            .unwrap()
             .with_collect_timeout(std::time::Duration::from_secs(60));
 
         let (test_x, _) = make_data(30, n_features, 99);
@@ -259,7 +260,7 @@ mod gpu_tests {
         forest.fit(&train_x.view(), &train_y.view());
 
         let flat = FlatForest::from_forest(&forest, n_features);
-        let gpu_forest = GpuForest::from_flat_forest(&flat, 20);
+        let gpu_forest = GpuForest::from_flat_forest(&flat, 20).unwrap();
 
         let (test_x, _) = make_data(10, n_features, 50);
         let test_x_f32 = test_x.mapv(|v| v as f32);
@@ -283,7 +284,7 @@ mod gpu_tests {
         forest.fit(&train_x.view(), &train_y.view());
 
         let flat = FlatForest::from_forest(&forest, n_features);
-        let gpu_forest = GpuForest::from_flat_forest(&flat, 100);
+        let gpu_forest = GpuForest::from_flat_forest(&flat, 100).unwrap();
         let forked = gpu_forest.fork(100);
 
         let (test_x, _) = make_data(50, n_features, 99);
@@ -312,7 +313,7 @@ mod gpu_tests {
         forest.fit(&train_x.view(), &train_y.view());
 
         let flat = FlatForest::from_forest(&forest, n_features);
-        let gpu_forest = GpuForest::from_flat_forest(&flat, 10); // max_samples=10
+        let gpu_forest = GpuForest::from_flat_forest(&flat, 10).unwrap(); // max_samples=10
 
         let (test_x, _) = make_data(20, n_features, 99); // 20 > 10
         let test_x_f32 = test_x.mapv(|v| v as f32);
@@ -333,7 +334,7 @@ mod gpu_tests {
         forest.fit(&train_x.view(), &train_y.view());
 
         let flat = FlatForest::from_forest(&forest, n_features);
-        let gpu_forest = GpuForest::from_flat_forest(&flat, 50);
+        let gpu_forest = GpuForest::from_flat_forest(&flat, 50).unwrap();
 
         let (test_x, _) = make_data(30, n_features, 99);
         let test_x_f32 = test_x.mapv(|v| v as f32);
@@ -366,7 +367,7 @@ mod gpu_tests {
         let flat = FlatForest::from_forest(&forest, n_features);
 
         // Two independent handles sharing compiled pipelines and node data.
-        let forest_a = GpuForest::from_flat_forest(&flat, 100);
+        let forest_a = GpuForest::from_flat_forest(&flat, 100).unwrap();
         let forest_b = forest_a.fork(100);
 
         let (test_x_a, _) = make_data(70, n_features, 101);

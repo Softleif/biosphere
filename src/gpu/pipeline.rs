@@ -1,9 +1,78 @@
 use crate::flat_forest::{FlatForest, FlatNode, ForestMeta};
 use ndarray::{Array1, ArrayView2};
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use wgpu::util::DeviceExt;
+
+/// Error returned by [`GpuForest::from_flat_forest`].
+///
+/// Call [`GpuInitError::hints`] for a step-by-step checklist that covers the
+/// most common causes of GPU initialization failures in headless / HPC / SLURM
+/// environments.
+#[derive(Debug)]
+pub struct GpuInitError {
+    message: String,
+    source: Option<wgpu::RequestDeviceError>,
+}
+
+impl GpuInitError {
+    fn no_adapter() -> Self {
+        Self {
+            message: "no suitable GPU adapter found; in headless / HPC / SLURM environments \
+                      this typically means the Vulkan ICD is not linked to the allocated GPU"
+                .to_owned(),
+            source: None,
+        }
+    }
+
+    fn device_creation(e: wgpu::RequestDeviceError) -> Self {
+        // `allowed: 0` for a compute limit means wgpu found no real GPU adapter
+        // with compute support — the Vulkan ICD is not wired up to the allocated
+        // device (common in headless / HPC / SLURM jobs).
+        let dbg = format!("{e:?}");
+        let message = if dbg.contains("allowed: 0") || dbg.contains("LimitsExceeded") {
+            format!(
+                "GPU device creation failed ({e}); `allowed: 0` for a compute limit \
+                 indicates wgpu found no real adapter with compute support — the Vulkan \
+                 ICD is likely not linked to the allocated device"
+            )
+        } else {
+            format!("GPU device creation failed: {e}")
+        };
+        Self { message, source: Some(e) }
+    }
+
+    /// Returns a step-by-step checklist for resolving GPU initialization
+    /// failures in headless / HPC / SLURM environments.
+    ///
+    /// Print this alongside the error to give users actionable next steps:
+    ///
+    /// ```text
+    /// eprintln!("Error: {err}\n\n{}", GpuInitError::hints());
+    /// ```
+    pub fn hints() -> &'static str {
+        "Checklist:\n  \
+         1. Confirm the GPU is allocated (SLURM: `--gres=gpu:1`; verify with `nvidia-smi`).\n  \
+         2. Export the Vulkan ICD explicitly:\n     \
+            export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json\n  \
+         3. Load cluster modules if required (e.g. `module load cuda vulkan`).\n  \
+         4. Confirm Vulkan works inside the job with `vulkaninfo --summary`."
+    }
+}
+
+impl fmt::Display for GpuInitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for GpuInitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_ref().map(|e| e as _)
+    }
+}
 
 /// GPU state shared across all [`GpuForest`] instances forked from the same forest.
 ///
@@ -154,11 +223,17 @@ impl GpuForest {
     /// no precision loss occurs during upload.
     ///
     /// [`predict`]: GpuForest::predict
-    pub fn from_flat_forest(flat: &FlatForest, max_samples: usize) -> Self {
+    pub fn from_flat_forest(
+        flat: &FlatForest,
+        max_samples: usize,
+    ) -> Result<Self, GpuInitError> {
         pollster::block_on(Self::from_flat_forest_async(flat, max_samples))
     }
 
-    async fn from_flat_forest_async(flat: &FlatForest, max_samples: usize) -> Self {
+    async fn from_flat_forest_async(
+        flat: &FlatForest,
+        max_samples: usize,
+    ) -> Result<Self, GpuInitError> {
         // --- Device initialisation ---
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let adapter = instance
@@ -168,7 +243,7 @@ impl GpuForest {
                 force_fallback_adapter: false,
             })
             .await
-            .expect("No suitable GPU adapter found");
+            .map_err(|_| GpuInitError::no_adapter())?;
 
         // On unified-memory adapters (Apple Silicon, Vulkan/DX12 UMA) the
         // MAPPABLE_PRIMARY_BUFFERS feature lets us combine STORAGE with MAP_READ
@@ -178,7 +253,7 @@ impl GpuForest {
             .features()
             .contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS);
 
-        let (device, queue) = adapter
+        let (device, queue): (wgpu::Device, wgpu::Queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 required_features: if uma {
                     wgpu::Features::MAPPABLE_PRIMARY_BUFFERS
@@ -188,7 +263,7 @@ impl GpuForest {
                 ..Default::default()
             })
             .await
-            .expect("Failed to create GPU device");
+            .map_err(GpuInitError::device_creation)?;
 
         // --- Static buffers ---
         // FlatNode is #[repr(C)] + bytemuck::Pod, so we can upload the node slice
@@ -295,7 +370,7 @@ impl GpuForest {
             uma,
         });
 
-        Self::alloc_buffers(shared, max_samples)
+        Ok(Self::alloc_buffers(shared, max_samples))
     }
 
     /// Allocate the per-instance inference buffers for `max_samples` capacity.
@@ -393,6 +468,7 @@ impl GpuForest {
     /// #        f.fit(&Array2::<f64>::zeros((2,1)).view(), &ndarray::Array1::zeros(2).view()); f },
     /// #     1);
     /// let gpu_forest = GpuForest::from_flat_forest(&flat, 1024)
+    ///     .unwrap()
     ///     .with_collect_timeout(std::time::Duration::from_secs(60));
     /// ```
     pub fn with_collect_timeout(mut self, timeout: Duration) -> Self {
