@@ -46,7 +46,7 @@ mod gpu_tests {
         let cpu_preds = flat.predict(&test_x_f32.view());
 
         let gpu_forest = GpuForest::from_flat_forest(&flat, 100).unwrap();
-        let gpu_preds = gpu_forest.predict(&test_x_f32.view());
+        let gpu_preds = gpu_forest.predict(&test_x_f32.view()).unwrap();
 
         // Both FlatForest and GpuForest use f32 nodes and f32 comparisons.
         // The only difference is f64 vs f32 accumulation; tolerance ~1e-5.
@@ -76,7 +76,7 @@ mod gpu_tests {
         let cpu_preds = flat.predict(&test_x_f32.view());
 
         let gpu_forest = GpuForest::from_flat_forest(&flat, 1).unwrap();
-        let gpu_preds = gpu_forest.predict(&test_x_f32.view());
+        let gpu_preds = gpu_forest.predict(&test_x_f32.view()).unwrap();
 
         assert!(
             ((cpu_preds[0] as f32) - gpu_preds[0]).abs() < 1e-5,
@@ -109,7 +109,7 @@ mod gpu_tests {
             let test_x_f32 = test_x.mapv(|v| v as f32);
 
             let cpu_preds = flat.predict(&test_x_f32.view());
-            let gpu_preds = gpu_forest.predict(&test_x_f32.view());
+            let gpu_preds = gpu_forest.predict(&test_x_f32.view()).unwrap();
 
             assert_eq!(
                 gpu_preds.len(),
@@ -149,8 +149,8 @@ mod gpu_tests {
         let cpu1 = flat.predict(&test_x1_f32.view());
         let cpu2 = flat.predict(&test_x2_f32.view());
 
-        let gpu1 = gpu_forest.predict(&test_x1_f32.view());
-        let gpu2 = gpu_forest.predict(&test_x2_f32.view());
+        let gpu1 = gpu_forest.predict(&test_x1_f32.view()).unwrap();
+        let gpu2 = gpu_forest.predict(&test_x2_f32.view()).unwrap();
 
         for (i, (cpu, gpu)) in cpu1.iter().zip(gpu1.iter()).enumerate() {
             assert!(
@@ -185,7 +185,7 @@ mod gpu_tests {
 
         let cpu_preds = flat.predict(&test_x_f32.view());
         let gpu_forest = GpuForest::from_flat_forest(&flat, 50).unwrap();
-        let gpu_preds = gpu_forest.predict(&test_x_f32.view());
+        let gpu_preds = gpu_forest.predict(&test_x_f32.view()).unwrap();
 
         for (i, (cpu, gpu)) in cpu_preds.iter().zip(gpu_preds.iter()).enumerate() {
             assert!(
@@ -236,7 +236,7 @@ mod gpu_tests {
         let test_x_f32 = test_x.mapv(|v| v as f32);
 
         let cpu_preds = flat.predict(&test_x_f32.view());
-        let gpu_preds = gpu_forest.predict(&test_x_f32.view());
+        let gpu_preds = gpu_forest.predict(&test_x_f32.view()).unwrap();
 
         for (i, (cpu, gpu)) in cpu_preds.iter().zip(gpu_preds.iter()).enumerate() {
             assert!(
@@ -267,7 +267,33 @@ mod gpu_tests {
 
         let _handle = gpu_forest.predict_submit(&test_x_f32.view()).unwrap();
         // Second submit without collecting _handle — should panic.
-        gpu_forest.predict_submit(&test_x_f32.view());
+        let _ = gpu_forest.predict_submit(&test_x_f32.view());
+    }
+
+    // --- Fix 5: double-submit guard test ---
+    /// Verifies the busy-flag panic message contains "outstanding PredictHandle".
+    /// Uses a minimal dataset (10 samples, 3 features, 5 trees) to keep it fast.
+    #[test]
+    #[should_panic(expected = "outstanding PredictHandle")]
+    fn gpu_double_submit_panics() {
+        let n_features = 3;
+        let (train_x, train_y) = make_data(50, n_features, 99);
+        let params = RandomForestParameters::default()
+            .with_n_estimators(5)
+            .with_seed(99);
+        let mut forest = RandomForest::new(params);
+        forest.fit(&train_x.view(), &train_y.view());
+
+        let flat = FlatForest::from_forest(&forest, n_features);
+        let gpu_forest = GpuForest::from_flat_forest(&flat, 10).unwrap();
+
+        let (test_x, _) = make_data(10, n_features, 200);
+        let test_x_f32 = test_x.mapv(|v| v as f32);
+
+        // First submit — OK.
+        let _handle_a = gpu_forest.predict_submit(&test_x_f32.view()).unwrap();
+        // Second submit without collecting _handle_a — must panic.
+        let _ = gpu_forest.predict_submit(&test_x_f32.view());
     }
 
     // --- Test #10: GpuForest::fork ---
@@ -290,8 +316,8 @@ mod gpu_tests {
         let (test_x, _) = make_data(50, n_features, 99);
         let test_x_f32 = test_x.mapv(|v| v as f32);
 
-        let preds_orig = gpu_forest.predict(&test_x_f32.view());
-        let preds_fork = forked.predict(&test_x_f32.view());
+        let preds_orig = gpu_forest.predict(&test_x_f32.view()).unwrap();
+        let preds_fork = forked.predict(&test_x_f32.view()).unwrap();
 
         assert_eq!(preds_orig.len(), preds_fork.len());
         for (i, (p1, p2)) in preds_orig.iter().zip(preds_fork.iter()).enumerate() {
@@ -317,7 +343,7 @@ mod gpu_tests {
 
         let (test_x, _) = make_data(20, n_features, 99); // 20 > 10
         let test_x_f32 = test_x.mapv(|v| v as f32);
-        gpu_forest.predict(&test_x_f32.view()); // should panic
+        let _ = gpu_forest.predict(&test_x_f32.view()); // should panic
     }
 
     // --- Test #13: GPU predictions are deterministic across calls ---
@@ -339,9 +365,9 @@ mod gpu_tests {
         let (test_x, _) = make_data(30, n_features, 99);
         let test_x_f32 = test_x.mapv(|v| v as f32);
 
-        let preds1 = gpu_forest.predict(&test_x_f32.view());
-        let preds2 = gpu_forest.predict(&test_x_f32.view());
-        let preds3 = gpu_forest.predict(&test_x_f32.view());
+        let preds1 = gpu_forest.predict(&test_x_f32.view()).unwrap();
+        let preds2 = gpu_forest.predict(&test_x_f32.view()).unwrap();
+        let preds3 = gpu_forest.predict(&test_x_f32.view()).unwrap();
 
         for i in 0..preds1.len() {
             assert_eq!(preds1[i], preds2[i], "run 1 vs 2, sample {i}");
@@ -380,12 +406,18 @@ mod gpu_tests {
         let cpu_b = flat.predict(&test_b_f32.view());
 
         // Submit both batches to the GPU without waiting for either to finish.
-        let handle_a = forest_a.predict_submit(&test_a_f32.view()).unwrap();
-        let handle_b = forest_b.predict_submit(&test_b_f32.view()).unwrap();
+        let handle_a = forest_a
+            .predict_submit(&test_a_f32.view())
+            .unwrap()
+            .unwrap();
+        let handle_b = forest_b
+            .predict_submit(&test_b_f32.view())
+            .unwrap()
+            .unwrap();
 
         // Collect in submission order; both results must be correct.
-        let gpu_a = handle_a.collect();
-        let gpu_b = handle_b.collect();
+        let gpu_a = handle_a.collect().unwrap();
+        let gpu_b = handle_b.collect().unwrap();
 
         assert_eq!(gpu_a.len(), 70);
         assert_eq!(gpu_b.len(), 50);

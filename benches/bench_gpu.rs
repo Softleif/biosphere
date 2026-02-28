@@ -47,7 +47,7 @@ fn benchmark_predict(c: &mut Criterion) {
     let flat = FlatForest::from_forest(&forest, N_FEATURES);
 
     let max_n = *SAMPLE_SIZES.iter().max().unwrap();
-    let gpu = GpuForest::from_flat_forest(&flat, max_n);
+    let gpu = GpuForest::from_flat_forest(&flat, max_n).unwrap();
 
     let mut group = c.benchmark_group("predict");
 

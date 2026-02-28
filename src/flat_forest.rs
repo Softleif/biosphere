@@ -112,7 +112,10 @@ impl FlatForest {
     /// Build a `FlatForest` from a trained `RandomForest`.
     ///
     /// `n_features` must match the number of features the forest was trained on.
+    /// Passing an incorrect value will produce silently wrong predictions,
+    /// because `n_features` is used as the GPU shader's feature-indexing stride.
     pub fn from_forest(forest: &RandomForest, n_features: usize) -> Self {
+        assert!(n_features > 0, "n_features must be > 0");
         let trees = forest.trees();
         let n_trees = trees.len();
         assert!(n_trees > 0, "Forest must have at least one tree");
@@ -154,17 +157,24 @@ impl FlatForest {
     /// GPU inference. The per-tree leaf values (f32) are accumulated in f64 and
     /// the final mean is returned as `Array1<f64>`.
     ///
+    /// `X` may be in any memory layout (row-major, column-major, or
+    /// non-contiguous). The method converts to C-order internally; if `X` is
+    /// already row-major this is a zero-copy borrow.
+    ///
     /// The loop order is outer=tree, inner=sample so that each tree's node array
     /// stays warm in L3 cache while all samples are processed against it, rather
     /// than re-loading every tree's nodes for every sample.
     pub fn predict(&self, X: &ArrayView2<f32>) -> Array1<f64> {
-        let n_samples = X.nrows();
+        let X_c = X.as_standard_layout();
+        let n_samples = X_c.nrows();
         let mut output = Array1::<f64>::zeros(n_samples);
 
         for tree_idx in 0..self.meta.n_trees as usize {
             for sample in 0..n_samples {
-                let row = X.row(sample);
-                let features = row.as_slice().expect("feature row must be contiguous");
+                let row = X_c.row(sample);
+                let features = row
+                    .as_slice()
+                    .expect("standard layout is always contiguous");
                 output[sample] += self.predict_one(tree_idx, features);
             }
         }
@@ -186,8 +196,11 @@ impl FlatForest {
                 idx = node.right as usize;
             }
         }
-        panic!(
-            "predict_one: traversal exceeded max_depth ({}); tree may be malformed",
+        // max_depth is computed from node_depth() during from_forest, so max_depth + 1
+        // iterations always reach a leaf for a correctly built tree. Reaching here
+        // indicates a bug in from_forest or fill_bfs.
+        unreachable!(
+            "predict_one: traversal exceeded max_depth={}",
             self.meta.max_depth
         );
     }
@@ -360,8 +373,14 @@ fn node_depth(node: &DecisionTreeNode) -> usize {
     if node.feature_index.is_none() {
         0
     } else {
-        1 + node_depth(node.left_child.as_ref().unwrap())
-            .max(node_depth(node.right_child.as_ref().unwrap()))
+        1 + node_depth(
+            node.left_child
+                .as_ref()
+                .expect("internal node (feature_index is Some) must have a left child"),
+        )
+        .max(node_depth(node.right_child.as_ref().expect(
+            "internal node (feature_index is Some) must have a right child",
+        )))
     }
 }
 
@@ -370,8 +389,15 @@ fn count_nodes(node: &DecisionTreeNode) -> usize {
     if node.feature_index.is_none() {
         1
     } else {
-        1 + count_nodes(node.left_child.as_ref().unwrap())
-            + count_nodes(node.right_child.as_ref().unwrap())
+        1 + count_nodes(
+            node.left_child
+                .as_ref()
+                .expect("internal node (feature_index is Some) must have a left child"),
+        ) + count_nodes(
+            node.right_child
+                .as_ref()
+                .expect("internal node (feature_index is Some) must have a right child"),
+        )
     }
 }
 
@@ -393,17 +419,33 @@ fn fill_bfs(root: &DecisionTreeNode, nodes: &mut [FlatNode]) {
                 left: left_idx as i32,
                 right: right_idx as i32,
                 feature_index: feature_index as u32,
-                value: node.feature_value.unwrap() as f32,
+                value: node
+                    .feature_value
+                    .expect("internal node (feature_index is Some) must have a feature_value")
+                    as f32,
             };
 
-            queue.push_back((node.left_child.as_ref().unwrap(), left_idx));
-            queue.push_back((node.right_child.as_ref().unwrap(), right_idx));
+            queue.push_back((
+                node.left_child
+                    .as_ref()
+                    .expect("internal node (feature_index is Some) must have a left child"),
+                left_idx,
+            ));
+            queue.push_back((
+                node.right_child
+                    .as_ref()
+                    .expect("internal node (feature_index is Some) must have a right child"),
+                right_idx,
+            ));
         } else {
             nodes[idx] = FlatNode {
                 left: -1,
                 right: -1,
                 feature_index: 0,
-                value: node.label.unwrap() as f32,
+                value: node
+                    .label
+                    .expect("leaf node (feature_index is None) must have a label")
+                    as f32,
             };
         }
     }

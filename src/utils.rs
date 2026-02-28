@@ -3,6 +3,8 @@ use rand::Rng;
 
 /// Compute `indices` such that `data.select(indices)` is sorted.
 ///
+/// NaN values, if present, are sorted after all finite values (IEEE 754 total order).
+///
 /// Parameters
 /// ----------
 /// data: `Array1<f64>` or `ArrayView1<f64>`
@@ -48,6 +50,9 @@ pub fn oob_samples_from_weights(weights: &[usize]) -> Vec<usize> {
     oob_samples
 }
 
+/// For each feature column, return `samples` sorted by ascending feature value.
+///
+/// NaN values, if present, are sorted after all finite values (IEEE 754 total order).
 pub fn sorted_samples(
     X: &ArrayBase<impl Data<Elem = f64>, Ix2>,
     samples: &[usize],

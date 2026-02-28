@@ -410,7 +410,11 @@ mod tests {
 
         let node = DecisionTreeNode::default();
         let mut samples = (0..100).collect::<Vec<usize>>();
-        samples.sort_unstable_by(|a, b| X[[*a, 0]].partial_cmp(&X[[*b, 0]]).unwrap());
+        samples.sort_unstable_by(|a, b| {
+            let xa: f64 = X[[*a, 0]];
+            let xb: f64 = X[[*b, 0]];
+            xa.total_cmp(&xb)
+        });
 
         let (split, split_val, gain, sum) =
             node.find_best_split(&X.view(), &y.view(), 0, &samples, 0.);

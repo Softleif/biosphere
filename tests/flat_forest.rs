@@ -190,11 +190,12 @@ fn feature_at_last_index() {
     );
 }
 
-// --- Test #6: non-contiguous input panics ---
-/// Passing a transposed (non-C-contiguous) view panics with the expected message.
+// --- Test #6: column-major input produces the same predictions as row-major ---
+/// `predict` must accept any memory layout by converting to C-order internally.
+/// A transposed (column-major) view must yield identical results to the normal
+/// row-major view with the same data.
 #[test]
-#[should_panic(expected = "feature row must be contiguous")]
-fn non_contiguous_input_panics() {
+fn non_contiguous_input_matches_contiguous() {
     let (X, y) = make_data(50, 4, 88);
     let params = RandomForestParameters::default()
         .with_n_estimators(3)
@@ -203,11 +204,24 @@ fn non_contiguous_input_panics() {
     forest.fit(&X.view(), &y.view());
 
     let flat = FlatForest::from_forest(&forest, 4);
-    // Transpose a (n_features, n_samples) array: result has shape (n_samples, n_features)
-    // but each row has stride n_features instead of 1 → as_slice() returns None → panics.
-    let mat = Array2::<f32>::zeros((4, 20));
-    let non_contig = mat.t(); // shape (20, 4), rows not contiguous
-    flat.predict(&non_contig);
+
+    // Build a row-major (n_samples, n_features) f32 matrix.
+    let mat_c = Array2::<f32>::from_shape_fn((20, 4), |(i, j)| (i * 4 + j) as f32 * 0.01);
+    // Build the same data in column-major (Fortran) order by transposing a (4, 20) array.
+    // The transposed view has shape (20, 4) but column-major strides — rows are non-contiguous.
+    let mat_t = Array2::<f32>::from_shape_fn((4, 20), |(j, i)| (i * 4 + j) as f32 * 0.01);
+    let non_contig = mat_t.t(); // shape (20, 4), column-major
+
+    let preds_c = flat.predict(&mat_c.view());
+    let preds_nc = flat.predict(&non_contig);
+
+    assert_eq!(preds_c.len(), preds_nc.len());
+    for (a, b) in preds_c.iter().zip(preds_nc.iter()) {
+        assert!(
+            (a - b).abs() < 1e-9,
+            "row-major and column-major predictions differ: {a} vs {b}"
+        );
+    }
 }
 
 // --- Test #7: n_trees=1 ---

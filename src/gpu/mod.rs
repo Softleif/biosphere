@@ -29,7 +29,7 @@
 //! let test_X: Array2<f64> = /* ... your test data ... */
 //! # Array2::zeros((1, 1));
 //! let test_X_f32 = test_X.mapv(|v| v as f32);
-//! let predictions: ndarray::Array1<f32> = gpu_forest.predict(&test_X_f32.view());
+//! let predictions: ndarray::Array1<f32> = gpu_forest.predict(&test_X_f32.view()).unwrap();
 //! ```
 //!
 //! # Multiple forests — shared device
@@ -112,12 +112,12 @@
 //! # Array2::zeros((1, 2));
 //!
 //! // Submit both without waiting — the GPU can work on them concurrently.
-//! let handle_a = forest_a.predict_submit(&batch_a.view()).unwrap();
-//! let handle_b = forest_b.predict_submit(&batch_b.view()).unwrap();
+//! let handle_a = forest_a.predict_submit(&batch_a.view()).unwrap().unwrap();
+//! let handle_b = forest_b.predict_submit(&batch_b.view()).unwrap().unwrap();
 //!
 //! // Collect in any order; each blocks only until its own submission is done.
-//! let preds_a = handle_a.collect();
-//! let preds_b = handle_b.collect();
+//! let preds_a = handle_a.collect().unwrap();
+//! let preds_b = handle_b.collect().unwrap();
 //! ```
 //!
 //! Each [`GpuForest`] instance enforces a single-outstanding-handle constraint:
@@ -144,4 +144,4 @@
 //! [`RandomForest::predict`]: crate::RandomForest::predict
 
 mod pipeline;
-pub use pipeline::{GpuContext, GpuForest, GpuInitError, PredictHandle};
+pub use pipeline::{GpuContext, GpuForest, GpuInferenceError, GpuInitError, PredictHandle};

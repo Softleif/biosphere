@@ -7,6 +7,41 @@ use std::time::Duration;
 use wgpu::util::DeviceExt;
 
 // ---------------------------------------------------------------------------
+// GpuInferenceError
+// ---------------------------------------------------------------------------
+
+/// Error returned by [`GpuForest::predict`], [`GpuForest::predict_submit`], and
+/// [`PredictHandle::collect`] when a runtime GPU inference operation fails.
+///
+/// This is distinct from [`GpuInitError`], which covers GPU initialisation
+/// failures (adapter selection, device creation, pipeline compilation). Inference
+/// errors occur after the GPU is successfully initialised and reflect problems
+/// that arise during batched prediction, such as the GPU not completing within
+/// the configured timeout.
+#[derive(Debug)]
+pub enum GpuInferenceError {
+    /// The GPU did not complete within the configured timeout.
+    Timeout {
+        /// Which step timed out (e.g. "inference (UMA output readback)").
+        step: &'static str,
+        /// The timeout that was exceeded.
+        timeout: Duration,
+    },
+}
+
+impl fmt::Display for GpuInferenceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Timeout { step, timeout } => {
+                write!(f, "GPU timed out during {step} after {timeout:?}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for GpuInferenceError {}
+
+// ---------------------------------------------------------------------------
 // GpuInitError
 // ---------------------------------------------------------------------------
 
@@ -16,38 +51,42 @@ use wgpu::util::DeviceExt;
 /// most common causes of GPU initialization failures in headless / HPC / SLURM
 /// environments.
 #[derive(Debug)]
-pub struct GpuInitError {
-    message: String,
-    source: Option<wgpu::RequestDeviceError>,
+pub enum GpuInitError {
+    /// No suitable GPU adapter was found.
+    ///
+    /// In headless / HPC / SLURM environments this typically means the Vulkan
+    /// ICD is not linked to the allocated GPU.
+    NoAdapter,
+
+    /// The GPU device could not be created.
+    ///
+    /// When `limits_exceeded` is `true`, the adapter reported zero capacity for
+    /// a required compute limit, which usually means wgpu fell back to a
+    /// software rasteriser or stub driver with no real compute support.
+    DeviceCreation {
+        source: Box<wgpu::RequestDeviceError>,
+        /// `true` when the Debug representation of the underlying error
+        /// contains `"allowed: 0"` or `"LimitsExceeded"`, indicating the
+        /// adapter lacks real compute support.
+        limits_exceeded: bool,
+    },
 }
 
 impl GpuInitError {
-    fn no_adapter() -> Self {
-        Self {
-            message: "no suitable GPU adapter found; in headless / HPC / SLURM environments \
-                      this typically means the Vulkan ICD is not linked to the allocated GPU"
-                .to_owned(),
-            source: None,
-        }
-    }
-
     fn device_creation(e: wgpu::RequestDeviceError) -> Self {
-        // `allowed: 0` for a compute limit means wgpu found no real GPU adapter
-        // with compute support — the Vulkan ICD is not wired up to the allocated
-        // device (common in headless / HPC / SLURM jobs).
+        // wgpu 28 does not expose structured error variants for
+        // `RequestDeviceError`; the only way to distinguish a "no real adapter
+        // with compute support" failure from other device-creation errors is to
+        // inspect the Debug representation. The strings `"allowed: 0"` and
+        // `"LimitsExceeded"` were verified against wgpu 28 and reflect how it
+        // formats limit-exceeded errors internally. If wgpu changes its internal
+        // formatting in a future release this heuristic may need updating.
+        // TODO: switch to structured matching when wgpu exposes error variants.
         let dbg = format!("{e:?}");
-        let message = if dbg.contains("allowed: 0") || dbg.contains("LimitsExceeded") {
-            format!(
-                "GPU device creation failed ({e}); `allowed: 0` for a compute limit \
-                 indicates wgpu found no real adapter with compute support — the Vulkan \
-                 ICD is likely not linked to the allocated device"
-            )
-        } else {
-            format!("GPU device creation failed: {e}")
-        };
-        Self {
-            message,
-            source: Some(e),
+        let limits_exceeded = dbg.contains("allowed: 0") || dbg.contains("LimitsExceeded");
+        Self::DeviceCreation {
+            source: Box::new(e),
+            limits_exceeded,
         }
     }
 
@@ -71,13 +110,34 @@ impl GpuInitError {
 
 impl fmt::Display for GpuInitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.message)
+        match self {
+            Self::NoAdapter => f.write_str(
+                "no suitable GPU adapter found; in headless / HPC / SLURM environments \
+                 this typically means the Vulkan ICD is not linked to the allocated GPU",
+            ),
+            Self::DeviceCreation {
+                source,
+                limits_exceeded: true,
+            } => write!(
+                f,
+                "GPU device creation failed ({source}); `allowed: 0` for a compute limit \
+                 indicates wgpu found no real adapter with compute support — the Vulkan \
+                 ICD is likely not linked to the allocated device",
+            ),
+            Self::DeviceCreation {
+                source,
+                limits_exceeded: false,
+            } => write!(f, "GPU device creation failed: {source}"),
+        }
     }
 }
 
 impl std::error::Error for GpuInitError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source.as_ref().map(|e| e as _)
+        match self {
+            Self::NoAdapter => None,
+            Self::DeviceCreation { source, .. } => Some(source),
+        }
     }
 }
 
@@ -136,7 +196,7 @@ impl GpuContext {
                 force_fallback_adapter: false,
             })
             .await
-            .map_err(|_| GpuInitError::no_adapter())?;
+            .map_err(|_| GpuInitError::NoAdapter)?;
 
         // On unified-memory adapters (Apple Silicon, Vulkan/DX12 UMA) the
         // MAPPABLE_PRIMARY_BUFFERS feature lets us combine STORAGE with MAP_READ
@@ -294,9 +354,12 @@ impl<'forest> PredictHandle<'forest> {
     ///
     /// One `f32` per sample, in the same order as the input to [`GpuForest::predict_submit`].
     ///
-    /// Panics if the GPU does not complete within the timeout configured via
-    /// [`GpuForest::with_collect_timeout`] (default: 10 seconds).
-    pub fn collect(self) -> Array1<f32> {
+    /// # Errors
+    ///
+    /// Returns [`GpuInferenceError`] if the GPU does not complete within the
+    /// timeout configured via [`GpuForest::with_collect_timeout`] (default: 10
+    /// seconds). Increase the timeout for very large forests or slow adapters.
+    pub fn collect(self) -> Result<Array1<f32>, GpuInferenceError> {
         let device = &self.forest.shared.ctx.device;
         let timeout = self.forest.collect_timeout;
 
@@ -312,7 +375,10 @@ impl<'forest> PredictHandle<'forest> {
                     submission_index: Some(self.submit_idx),
                     timeout: Some(timeout),
                 })
-                .expect("GPU timed out during inference; consider increasing the timeout with GpuForest::with_collect_timeout");
+                .map_err(|_| GpuInferenceError::Timeout {
+                    step: "inference (UMA output readback)",
+                    timeout,
+                })?;
             let data = slice.get_mapped_range();
             let result = Array1::from(bytemuck::cast_slice::<u8, f32>(&data).to_vec());
             drop(data);
@@ -331,7 +397,10 @@ impl<'forest> PredictHandle<'forest> {
                     submission_index: Some(self.submit_idx),
                     timeout: Some(timeout),
                 })
-                .expect("GPU timed out during inference; consider increasing the timeout with GpuForest::with_collect_timeout");
+                .map_err(|_| GpuInferenceError::Timeout {
+                    step: "inference (discrete GPU output readback)",
+                    timeout,
+                })?;
             let data = buffer_slice.get_mapped_range();
             let result = Array1::from(bytemuck::cast_slice::<u8, f32>(&data).to_vec());
             drop(data);
@@ -341,7 +410,7 @@ impl<'forest> PredictHandle<'forest> {
 
         // Release the busy flag so predict_submit can be called again.
         self.forest.busy.store(false, Ordering::Release);
-        result
+        Ok(result)
     }
 }
 
@@ -396,6 +465,14 @@ impl GpuForest {
     ///
     /// This is the preferred constructor when serving multiple forests at
     /// inference time.
+    ///
+    /// # Panics
+    ///
+    /// Buffer allocation failures (e.g. GPU out-of-memory) result in a panic
+    /// from the underlying wgpu backend rather than a returned error; GPU OOM
+    /// will terminate the process. This matches the behaviour of `wgpu::Device::create_buffer`,
+    /// which panics internally on OOM in current wgpu rather than returning a `Result`.
+    /// For this reason `with_context` returns `Self` rather than `Result<Self, …>`.
     ///
     /// ```rust,no_run
     /// # use biosphere::{FlatForest, RandomForest, RandomForestParameters};
@@ -467,6 +544,11 @@ impl GpuForest {
 
     /// Allocate the per-instance inference buffers for `max_samples` capacity.
     fn alloc_buffers(shared: Arc<GpuForestShared>, max_samples: usize) -> Self {
+        assert!(
+            max_samples > 0,
+            "max_samples must be at least 1; use GpuForest::predict for batches and handle \
+             empty input at the call site"
+        );
         let device = &shared.ctx.device;
         let n_trees = shared.meta.n_trees as usize;
         let n_features = shared.meta.n_features as usize;
@@ -583,10 +665,15 @@ impl GpuForest {
     /// to wait for completion and retrieve predictions. Submitting multiple handles before
     /// collecting any allows the GPU to execute the work concurrently.
     ///
-    /// Returns `None` when `X` has zero rows.
+    /// Returns `Ok(None)` when `X` has zero rows.
     ///
     /// `X` is a 2-D array of shape `(n_samples, n_features)`. If `X` is not
     /// already in C (row-major) contiguous order it will be copied before upload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GpuInferenceError`] if the UMA feature-buffer mapping poll times
+    /// out (controlled by [`GpuForest::with_collect_timeout`]; default 10 s).
     ///
     /// # Panics
     ///
@@ -594,10 +681,13 @@ impl GpuForest {
     /// - If `X.ncols() != n_features`.
     /// - If called while a previously returned [`PredictHandle`] has not yet been collected
     ///   (would overwrite the feature buffer while the GPU is still reading it).
-    pub fn predict_submit(&self, X: &ArrayView2<f32>) -> Option<PredictHandle<'_>> {
+    pub fn predict_submit(
+        &self,
+        X: &ArrayView2<f32>,
+    ) -> Result<Option<PredictHandle<'_>>, GpuInferenceError> {
         let n_samples = X.nrows();
         if n_samples == 0 {
-            return None;
+            return Ok(None);
         }
 
         assert!(
@@ -638,8 +728,9 @@ impl GpuForest {
         if ctx.uma {
             // UMA path: map feature_buffer directly and write without a staging blit.
             // The buffer is guaranteed to be free here (enforced by the busy flag above).
-            // Use a bounded 1-second timeout to detect wgpu validation errors that would
-            // otherwise block forever.
+            // Use collect_timeout (not a hardcoded value) to detect wgpu validation errors
+            // that would otherwise block forever, while still respecting the caller's
+            // configured latency budget.
             let slice = self.feature_buffer.slice(..feature_bytes);
             slice.map_async(wgpu::MapMode::Write, |r| {
                 r.expect("feature buffer map failed");
@@ -647,12 +738,12 @@ impl GpuForest {
             device
                 .poll(wgpu::PollType::Wait {
                     submission_index: None,
-                    timeout: Some(Duration::from_secs(1)),
+                    timeout: Some(self.collect_timeout),
                 })
-                .expect(
-                    "GPU timed out waiting for UMA feature buffer to become available; \
-                     a wgpu validation error may have occurred",
-                );
+                .map_err(|_| GpuInferenceError::Timeout {
+                    step: "UMA feature buffer mapping (a wgpu validation error may have occurred)",
+                    timeout: self.collect_timeout,
+                })?;
             {
                 let mut mapped = slice.get_mapped_range_mut();
                 mapped.copy_from_slice(bytemuck::cast_slice(features));
@@ -756,29 +847,35 @@ impl GpuForest {
 
         let submit_idx = queue.submit(Some(encoder.finish()));
 
-        Some(PredictHandle {
+        Ok(Some(PredictHandle {
             forest: self,
             submit_idx,
             output_bytes,
-        })
+        }))
     }
 
     /// Run batched inference on `n_samples` samples, blocking until complete.
     ///
-    /// Equivalent to `predict_submit(X).map(|h| h.collect()).unwrap_or_default()`.
+    /// Equivalent to calling `predict_submit(X)` then `collect()` on the handle.
     /// Use [`GpuForest::predict_submit`] with deferred [`PredictHandle::collect`] to overlap
     /// GPU work across multiple forests.
     ///
     /// `X` is a 2-D array of shape `(n_samples, n_features)`.
     /// Returns one f32 prediction per sample (mean of all tree predictions).
     ///
+    /// # Errors
+    ///
+    /// Returns [`GpuInferenceError`] if the GPU times out. See
+    /// [`GpuForest::with_collect_timeout`] to adjust the limit (default: 10 s).
+    ///
     /// # Panics
     ///
     /// Panics if `X.nrows() > max_samples` (the value passed to [`GpuForest::from_flat_forest`]).
-    pub fn predict(&self, X: &ArrayView2<f32>) -> Array1<f32> {
-        self.predict_submit(X)
-            .map(|h| h.collect())
-            .unwrap_or_else(|| Array1::zeros(0))
+    pub fn predict(&self, X: &ArrayView2<f32>) -> Result<Array1<f32>, GpuInferenceError> {
+        match self.predict_submit(X)? {
+            Some(handle) => handle.collect(),
+            None => Ok(Array1::zeros(0)),
+        }
     }
 }
 

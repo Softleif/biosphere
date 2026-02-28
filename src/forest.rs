@@ -183,6 +183,12 @@ impl RandomForest {
         predictions / self.trees.len() as f64
     }
 
+    /// Fit the forest on training data.
+    ///
+    /// **Reproducibility note (v0.5):** Each tree's feature-selection seed is now derived
+    /// directly from its bootstrap seed rather than from a secondary RNG draw. Forests
+    /// trained with the same seed as v0.4.x will produce different trees starting from
+    /// v0.5.0.
     pub fn fit(&mut self, X: &ArrayView2<f64>, y: &ArrayView1<f64>) {
         let thread_pool = build_thread_pool(self.random_forest_parameters.n_jobs);
 
@@ -236,6 +242,11 @@ impl RandomForest {
     /// for which that sample was out-of-bag. Samples that were in-bag for every
     /// estimator (i.e. never left out during bootstrap sampling) will have
     /// `f64::NAN` as their OOB prediction.
+    ///
+    /// **Reproducibility note (v0.5):** Each tree's feature-selection seed is now derived
+    /// directly from its bootstrap seed rather than from a secondary RNG draw. Forests
+    /// trained with the same seed as v0.4.x will produce different trees starting from
+    /// v0.5.0.
     pub fn fit_predict_oob(&mut self, X: &ArrayView2<f64>, y: &ArrayView1<f64>) -> Array1<f64> {
         let thread_pool = build_thread_pool(self.random_forest_parameters.n_jobs);
 
