@@ -11,7 +11,10 @@ use std::collections::VecDeque;
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
-#[cfg_attr(feature = "gpu", derive(bytemuck::Pod, bytemuck::Zeroable))]
+#[cfg_attr(
+    any(feature = "gpu", feature = "serde"),
+    derive(bytemuck::Pod, bytemuck::Zeroable)
+)]
 pub struct ForestMeta {
     pub n_trees: u32,
     pub n_features: u32,
@@ -40,7 +43,10 @@ pub struct ForestMeta {
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
-#[cfg_attr(feature = "gpu", derive(bytemuck::Pod, bytemuck::Zeroable))]
+#[cfg_attr(
+    any(feature = "gpu", feature = "serde"),
+    derive(bytemuck::Pod, bytemuck::Zeroable)
+)]
 pub struct FlatNode {
     /// Index of the left child within the tree's node slice, or -1 for leaves.
     pub left: i32,
@@ -97,6 +103,8 @@ impl FlatNode {
 #[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct FlatForest {
     /// Flat node array: length = `meta.n_trees * meta.max_tree_size`.
+    // Serialized as raw bytes via bytemuck for speed (no per-field encoding).
+    #[cfg_attr(feature = "serde", serde(with = "flat_node_serde"))]
     pub(crate) nodes: Vec<FlatNode>,
     pub meta: ForestMeta,
 }
@@ -203,6 +211,54 @@ impl FlatForest {
             "predict_one: traversal exceeded max_depth={}",
             self.meta.max_depth
         );
+    }
+}
+
+#[cfg(feature = "serde")]
+mod flat_node_serde {
+    use super::FlatNode;
+    use serde::de::{Error, Visitor};
+    use serde::{Deserializer, Serializer};
+    use std::fmt;
+
+    pub fn serialize<S: Serializer>(nodes: &Vec<FlatNode>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_bytes(bytemuck::cast_slice(nodes.as_slice()))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<FlatNode>, D::Error> {
+        d.deserialize_bytes(NodesVisitor)
+    }
+
+    struct NodesVisitor;
+
+    impl<'de> Visitor<'de> for NodesVisitor {
+        type Value = Vec<FlatNode>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "raw bytes encoding a sequence of FlatNodes")
+        }
+
+        fn visit_bytes<E: Error>(self, v: &[u8]) -> Result<Self::Value, E> {
+            nodes_from_bytes(v).map_err(E::custom)
+        }
+
+        fn visit_byte_buf<E: Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
+            self.visit_bytes(&v)
+        }
+    }
+
+    fn nodes_from_bytes(bytes: &[u8]) -> Result<Vec<FlatNode>, String> {
+        let node_size = std::mem::size_of::<FlatNode>();
+        if bytes.len() % node_size != 0 {
+            return Err(format!(
+                "expected a multiple of {node_size} bytes (FlatNode size), got {}",
+                bytes.len()
+            ));
+        }
+        let n = bytes.len() / node_size;
+        let mut nodes = vec![bytemuck::Zeroable::zeroed(); n];
+        bytemuck::cast_slice_mut::<FlatNode, u8>(&mut nodes).copy_from_slice(bytes);
+        Ok(nodes)
     }
 }
 
