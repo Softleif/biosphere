@@ -55,6 +55,10 @@ harness = false
 name = "bench_tree"
 harness = false
 
+[[test]]
+name = "flat_forest_serde"
+required-features = ["serde"]
+
 [[bench]]
 name = "bench_tree_serde"
 harness = false

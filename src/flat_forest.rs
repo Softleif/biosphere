@@ -100,12 +100,12 @@ impl FlatNode {
 /// [`GpuForest::from_flat_forest`]: crate::gpu::GpuForest::from_flat_forest
 /// [`RandomForest`]: crate::RandomForest
 #[derive(Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Deserialize, serde::Serialize))]
 pub struct FlatForest {
     /// Flat node array: length = `meta.n_trees * meta.max_tree_size`.
-    // Serialized as raw bytes via bytemuck for speed (no per-field encoding).
-    #[cfg_attr(feature = "serde", serde(with = "flat_node_serde"))]
     pub(crate) nodes: Vec<FlatNode>,
+    /// Number of real (non-padding) nodes in each tree; computed once in
+    /// `from_forest` alongside `max_tree_size` and reused by serde.
+    pub(crate) tree_sizes: Vec<u32>,
     pub meta: ForestMeta,
 }
 
@@ -134,12 +134,9 @@ impl FlatForest {
             .max()
             .unwrap_or(0);
 
-        // Allocate only as many slots as the largest tree actually needs.
-        let max_tree_size = trees
-            .iter()
-            .map(|t| count_nodes(t.root()))
-            .max()
-            .unwrap_or(1);
+        let tree_sizes: Vec<u32> = trees.iter().map(|t| count_nodes(t.root()) as u32).collect();
+
+        let max_tree_size = tree_sizes.iter().copied().max().unwrap_or(1) as usize;
 
         let mut nodes = vec![FlatNode::dummy_leaf(); n_trees * max_tree_size];
 
@@ -150,6 +147,7 @@ impl FlatForest {
 
         FlatForest {
             nodes,
+            tree_sizes,
             meta: ForestMeta {
                 n_trees: n_trees as u32,
                 n_features: n_features as u32,
@@ -215,50 +213,126 @@ impl FlatForest {
 }
 
 #[cfg(feature = "serde")]
-mod flat_node_serde {
-    use super::FlatNode;
+mod serde_impl {
+    use super::{FlatForest, FlatNode, ForestMeta};
     use serde::de::{Error, Visitor};
-    use serde::{Deserializer, Serializer};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::fmt;
 
-    pub fn serialize<S: Serializer>(nodes: &Vec<FlatNode>, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_bytes(bytemuck::cast_slice(nodes.as_slice()))
-    }
+    /// Newtype that serializes/deserializes `Vec<FlatNode>` as raw bytes.
+    struct CompactNodes(Vec<FlatNode>);
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<FlatNode>, D::Error> {
-        d.deserialize_bytes(NodesVisitor)
-    }
-
-    struct NodesVisitor;
-
-    impl<'de> Visitor<'de> for NodesVisitor {
-        type Value = Vec<FlatNode>;
-
-        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            write!(f, "raw bytes encoding a sequence of FlatNodes")
-        }
-
-        fn visit_bytes<E: Error>(self, v: &[u8]) -> Result<Self::Value, E> {
-            nodes_from_bytes(v).map_err(E::custom)
-        }
-
-        fn visit_byte_buf<E: Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
-            self.visit_bytes(&v)
+    impl Serialize for CompactNodes {
+        fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            s.serialize_bytes(bytemuck::cast_slice(&self.0))
         }
     }
 
-    fn nodes_from_bytes(bytes: &[u8]) -> Result<Vec<FlatNode>, String> {
-        let node_size = std::mem::size_of::<FlatNode>();
-        if bytes.len() % node_size != 0 {
-            return Err(format!(
-                "expected a multiple of {node_size} bytes (FlatNode size), got {}",
-                bytes.len()
-            ));
+    impl<'de> Deserialize<'de> for CompactNodes {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            struct V;
+            impl<'de> Visitor<'de> for V {
+                type Value = CompactNodes;
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    write!(f, "raw bytes encoding a sequence of FlatNodes")
+                }
+                fn visit_bytes<E: Error>(self, v: &[u8]) -> Result<Self::Value, E> {
+                    let node_size = std::mem::size_of::<FlatNode>();
+                    if v.len() % node_size != 0 {
+                        return Err(E::custom(format!(
+                            "expected a multiple of {node_size} bytes (FlatNode size), got {}",
+                            v.len()
+                        )));
+                    }
+                    let n = v.len() / node_size;
+                    let mut nodes = vec![bytemuck::Zeroable::zeroed(); n];
+                    bytemuck::cast_slice_mut::<FlatNode, u8>(&mut nodes).copy_from_slice(v);
+                    Ok(CompactNodes(nodes))
+                }
+                fn visit_byte_buf<E: Error>(self, v: Vec<u8>) -> Result<Self::Value, E> {
+                    self.visit_bytes(&v)
+                }
+            }
+            d.deserialize_bytes(V)
         }
-        let n = bytes.len() / node_size;
-        let mut nodes = vec![bytemuck::Zeroable::zeroed(); n];
-        bytemuck::cast_slice_mut::<FlatNode, u8>(&mut nodes).copy_from_slice(bytes);
-        Ok(nodes)
+    }
+
+    /// Wire format: metadata + per-tree actual sizes + compact node bytes.
+    /// Padding (dummy leaves) is not stored; it is reconstructed on deserialize.
+    #[derive(Serialize, Deserialize)]
+    struct Wire {
+        meta: ForestMeta,
+        /// Number of real nodes in each tree (prefix of the padded slot array).
+        tree_sizes: Vec<u32>,
+        /// Compact node data: only actual nodes, no padding, raw bytes.
+        nodes: CompactNodes,
+    }
+
+    impl Serialize for FlatForest {
+        fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            let max_tree_size = self.meta.max_tree_size as usize;
+
+            let total: usize = self.tree_sizes.iter().map(|&s| s as usize).sum();
+            let mut compact = Vec::with_capacity(total);
+            for (i, &size) in self.tree_sizes.iter().enumerate() {
+                let offset = i * max_tree_size;
+                compact.extend_from_slice(&self.nodes[offset..offset + size as usize]);
+            }
+
+            Wire {
+                meta: self.meta,
+                tree_sizes: self.tree_sizes.clone(),
+                nodes: CompactNodes(compact),
+            }
+            .serialize(s)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for FlatForest {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            let Wire {
+                meta,
+                tree_sizes,
+                nodes: CompactNodes(compact),
+            } = Wire::deserialize(d)?;
+
+            let n_trees = meta.n_trees as usize;
+            let max_tree_size = meta.max_tree_size as usize;
+
+            if tree_sizes.len() != n_trees {
+                return Err(D::Error::custom(format!(
+                    "expected {n_trees} tree_sizes entries, got {}",
+                    tree_sizes.len()
+                )));
+            }
+            let expected_total: usize = tree_sizes.iter().map(|&s| s as usize).sum();
+            if compact.len() != expected_total {
+                return Err(D::Error::custom(format!(
+                    "expected {expected_total} compact nodes, got {}",
+                    compact.len()
+                )));
+            }
+
+            let mut nodes = vec![FlatNode::dummy_leaf(); n_trees * max_tree_size];
+            let mut src = 0;
+            for (i, &size) in tree_sizes.iter().enumerate() {
+                let size = size as usize;
+                if size > max_tree_size {
+                    return Err(D::Error::custom(format!(
+                        "tree {i}: size {size} exceeds max_tree_size {max_tree_size}"
+                    )));
+                }
+                let dst = i * max_tree_size;
+                nodes[dst..dst + size].copy_from_slice(&compact[src..src + size]);
+                src += size;
+            }
+
+            Ok(FlatForest {
+                nodes,
+                tree_sizes,
+                meta,
+            })
+        }
     }
 }
 
@@ -272,6 +346,7 @@ mod tests {
     use ndarray_rand::rand_distr::Uniform;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
+    use std::mem::size_of;
 
     fn make_data(
         n_samples: usize,
@@ -401,6 +476,53 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Serializing then deserializing a FlatForest produces the same predictions.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_round_trip_predictions() {
+        let (X, y) = make_data(150, 6, 99);
+        let params = RandomForestParameters::default()
+            .with_n_estimators(10)
+            .with_seed(99);
+        let mut forest = RandomForest::new(params);
+        forest.fit(&X.view(), &y.view());
+        let flat = FlatForest::from_forest(&forest, 6);
+
+        let bytes = postcard::to_stdvec(&flat).unwrap();
+        let restored: FlatForest = postcard::from_bytes(&bytes).unwrap();
+
+        let X_f32 = X.mapv(|v| v as f32);
+        let original = flat.predict(&X_f32.view());
+        let from_serde = restored.predict(&X_f32.view());
+        assert_eq!(
+            original, from_serde,
+            "predictions must match after round-trip"
+        );
+    }
+
+    /// Compact serialization is smaller than the full padded node array.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_compact_smaller_than_padded() {
+        let (X, y) = make_data(150, 8, 77);
+        let params = RandomForestParameters::default()
+            .with_n_estimators(20)
+            .with_seed(77);
+        let mut forest = RandomForest::new(params);
+        forest.fit(&X.view(), &y.view());
+        let flat = FlatForest::from_forest(&forest, 8);
+
+        let compact_bytes = postcard::to_stdvec(&flat).unwrap();
+        let padded_bytes =
+            flat.meta.n_trees as usize * flat.meta.max_tree_size as usize * size_of::<FlatNode>();
+        assert!(
+            compact_bytes.len() < padded_bytes,
+            "compact serde ({} bytes) should be smaller than raw padded layout ({} bytes)",
+            compact_bytes.len(),
+            padded_bytes
+        );
     }
 
     /// Count reachable nodes from root via BFS using explicit child indices.
