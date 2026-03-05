@@ -113,10 +113,8 @@ mod tests {
 
         let samples = sample_indices_from_weights(&weights, &indices);
 
-        for feature in 0..X.ncols() {
-            assert!(is_sorted(
-                &X.column(feature).select(Axis(0), &samples[feature])
-            ));
+        for (feature, sample) in samples.iter().enumerate().take(X.ncols()) {
+            assert!(is_sorted(&X.column(feature).select(Axis(0), sample)));
         }
     }
 }

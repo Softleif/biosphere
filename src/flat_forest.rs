@@ -105,6 +105,7 @@ pub struct FlatForest {
     pub(crate) nodes: Vec<FlatNode>,
     /// Number of real (non-padding) nodes in each tree; computed once in
     /// `from_forest` alongside `max_tree_size` and reused by serde.
+    #[allow(unused, reason = "serde needs this for round-trip validation")]
     pub(crate) tree_sizes: Vec<u32>,
     pub meta: ForestMeta,
 }
@@ -238,7 +239,7 @@ mod serde_impl {
                 }
                 fn visit_bytes<E: Error>(self, v: &[u8]) -> Result<Self::Value, E> {
                     let node_size = std::mem::size_of::<FlatNode>();
-                    if v.len() % node_size != 0 {
+                    if !v.len().is_multiple_of(node_size) {
                         return Err(E::custom(format!(
                             "expected a multiple of {node_size} bytes (FlatNode size), got {}",
                             v.len()
@@ -336,216 +337,6 @@ mod serde_impl {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::RandomForest;
-    use crate::forest::RandomForestParameters;
-    use ndarray::Array2;
-    use ndarray_rand::RandomExt;
-    use ndarray_rand::rand_distr::Uniform;
-    use rand::SeedableRng;
-    use rand::rngs::StdRng;
-    use std::mem::size_of;
-
-    fn make_data(
-        n_samples: usize,
-        n_features: usize,
-        seed: u64,
-    ) -> (Array2<f64>, ndarray::Array1<f64>) {
-        let mut rng = StdRng::seed_from_u64(seed);
-        let X = Array2::random_using(
-            (n_samples, n_features),
-            Uniform::new(0.0, 1.0).unwrap(),
-            &mut rng,
-        );
-        let y = X.column(0).to_owned();
-        (X, y)
-    }
-
-    /// nodes.len() must always equal n_trees * max_tree_size (test #16).
-    #[test]
-    fn nodes_length_invariant() {
-        let (X, y) = make_data(120, 6, 16);
-        let params = RandomForestParameters::default()
-            .with_n_estimators(15)
-            .with_seed(16);
-        let mut forest = RandomForest::new(params);
-        forest.fit(&X.view(), &y.view());
-
-        let flat = FlatForest::from_forest(&forest, 6);
-        assert_eq!(
-            flat.nodes.len(),
-            flat.n_trees as usize * flat.max_tree_size as usize,
-            "nodes.len() should equal n_trees * max_tree_size"
-        );
-    }
-
-    /// Every slot beyond a tree's real BFS footprint must be a dummy leaf (test #15).
-    #[test]
-    fn padding_nodes_are_leaves() {
-        let (X, y) = make_data(150, 8, 15);
-        let params = RandomForestParameters::default()
-            .with_n_estimators(10)
-            .with_seed(15);
-        let mut forest = RandomForest::new(params);
-        forest.fit(&X.view(), &y.view());
-
-        let flat = FlatForest::from_forest(&forest, 8);
-        let n_trees = flat.n_trees as usize;
-        let max_tree_size = flat.max_tree_size as usize;
-
-        for tree_idx in 0..n_trees {
-            let offset = tree_idx * max_tree_size;
-            let tree_nodes = &flat.nodes[offset..offset + max_tree_size];
-            let real_count = count_bfs_nodes(tree_nodes);
-            for i in real_count..max_tree_size {
-                assert!(
-                    tree_nodes[i].left < 0,
-                    "tree {tree_idx}, slot {i} (beyond real size {real_count}): expected dummy leaf, got left={}",
-                    tree_nodes[i].left
-                );
-            }
-        }
-    }
-
-    /// `max_tree_size` must equal the actual maximum node count, not the BFS positional
-    /// formula `2^(max_depth+1) - 1` (test #3). For unconstrained trees deep enough that
-    /// the positional layout would differ, the two values must diverge.
-    #[test]
-    fn max_tree_size_is_actual_count_not_bfs_formula() {
-        let (X, y) = make_data(150, 6, 42);
-        let params = RandomForestParameters::default()
-            .with_n_estimators(10)
-            .with_seed(42);
-        let mut forest = RandomForest::new(params);
-        forest.fit(&X.view(), &y.view());
-
-        let flat = FlatForest::from_forest(&forest, 6);
-
-        // Independent recomputation of max node count using the private helper.
-        let expected_max = forest
-            .trees()
-            .iter()
-            .map(|t| count_nodes(t.root()))
-            .max()
-            .unwrap();
-        assert_eq!(
-            flat.max_tree_size as usize, expected_max,
-            "max_tree_size should equal the actual max node count across trees"
-        );
-
-        // For trees with max_depth >= 4, the positional BFS layout would require
-        // at least 2^5 - 1 = 31 nodes, whereas typical trees with the same depth
-        // but sparse structure will have far fewer. Assert we use the compact count.
-        let bfs_formula = (1usize << (flat.max_depth as usize + 1)).saturating_sub(1);
-        if flat.max_depth >= 4 {
-            assert!(
-                (flat.max_tree_size as usize) < bfs_formula,
-                "max_tree_size ({}) should be less than BFS formula ({}) for depth-{} trees",
-                flat.max_tree_size,
-                bfs_formula,
-                flat.max_depth
-            );
-        }
-    }
-
-    /// Every padding node beyond a tree's real BFS footprint must have `value == 0.0` (test #5).
-    /// This verifies that `FlatNode::dummy_leaf()` initialises `value` to zero, so padding
-    /// slots cannot accidentally contribute non-zero predictions if the loop bound is wrong.
-    #[test]
-    fn dummy_leaf_value_is_zero() {
-        let (X, y) = make_data(150, 8, 50);
-        let params = RandomForestParameters::default()
-            .with_n_estimators(10)
-            .with_seed(50);
-        let mut forest = RandomForest::new(params);
-        forest.fit(&X.view(), &y.view());
-
-        let flat = FlatForest::from_forest(&forest, 8);
-        let max_tree_size = flat.max_tree_size as usize;
-
-        for tree_idx in 0..flat.n_trees as usize {
-            let offset = tree_idx * max_tree_size;
-            let tree_nodes = &flat.nodes[offset..offset + max_tree_size];
-            let real_count = count_bfs_nodes(tree_nodes);
-            for i in real_count..max_tree_size {
-                assert_eq!(
-                    tree_nodes[i].value, 0.0,
-                    "tree {tree_idx}, padding slot {i}: expected value=0.0"
-                );
-            }
-        }
-    }
-
-    /// Serializing then deserializing a FlatForest produces the same predictions.
-    #[cfg(feature = "serde")]
-    #[test]
-    fn serde_round_trip_predictions() {
-        let (X, y) = make_data(150, 6, 99);
-        let params = RandomForestParameters::default()
-            .with_n_estimators(10)
-            .with_seed(99);
-        let mut forest = RandomForest::new(params);
-        forest.fit(&X.view(), &y.view());
-        let flat = FlatForest::from_forest(&forest, 6);
-
-        let bytes = postcard::to_stdvec(&flat).unwrap();
-        let restored: FlatForest = postcard::from_bytes(&bytes).unwrap();
-
-        let X_f32 = X.mapv(|v| v as f32);
-        let original = flat.predict(&X_f32.view());
-        let from_serde = restored.predict(&X_f32.view());
-        assert_eq!(
-            original, from_serde,
-            "predictions must match after round-trip"
-        );
-    }
-
-    /// Compact serialization is smaller than the full padded node array.
-    #[cfg(feature = "serde")]
-    #[test]
-    fn serde_compact_smaller_than_padded() {
-        let (X, y) = make_data(150, 8, 77);
-        let params = RandomForestParameters::default()
-            .with_n_estimators(20)
-            .with_seed(77);
-        let mut forest = RandomForest::new(params);
-        forest.fit(&X.view(), &y.view());
-        let flat = FlatForest::from_forest(&forest, 8);
-
-        let compact_bytes = postcard::to_stdvec(&flat).unwrap();
-        let padded_bytes =
-            flat.meta.n_trees as usize * flat.meta.max_tree_size as usize * size_of::<FlatNode>();
-        assert!(
-            compact_bytes.len() < padded_bytes,
-            "compact serde ({} bytes) should be smaller than raw padded layout ({} bytes)",
-            compact_bytes.len(),
-            padded_bytes
-        );
-    }
-
-    /// Count reachable nodes from root via BFS using explicit child indices.
-    fn count_bfs_nodes(nodes: &[FlatNode]) -> usize {
-        use std::collections::VecDeque;
-        let mut queue = VecDeque::new();
-        queue.push_back(0usize);
-        let mut count = 0;
-        while let Some(idx) = queue.pop_front() {
-            if idx >= nodes.len() {
-                break;
-            }
-            count += 1;
-            let node = &nodes[idx];
-            if node.left >= 0 {
-                queue.push_back(node.left as usize);
-                queue.push_back(node.right as usize);
-            }
-        }
-        count
-    }
-}
-
 /// Recursively compute the depth of a node (0 = leaf, 1 = one split level, …).
 fn node_depth(node: &DecisionTreeNode) -> usize {
     if node.feature_index.is_none() {
@@ -626,5 +417,225 @@ fn fill_bfs(root: &DecisionTreeNode, nodes: &mut [FlatNode]) {
                     as f32,
             };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::RandomForest;
+    use crate::forest::RandomForestParameters;
+    use ndarray::Array2;
+    use ndarray_rand::RandomExt;
+    use ndarray_rand::rand_distr::Uniform;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+    use std::mem::size_of;
+
+    fn make_data(
+        n_samples: usize,
+        n_features: usize,
+        seed: u64,
+    ) -> (Array2<f64>, ndarray::Array1<f64>) {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let X = Array2::random_using(
+            (n_samples, n_features),
+            Uniform::new(0.0, 1.0).unwrap(),
+            &mut rng,
+        );
+        let y = X.column(0).to_owned();
+        (X, y)
+    }
+
+    /// nodes.len() must always equal n_trees * max_tree_size (test #16).
+    #[test]
+    fn nodes_length_invariant() {
+        let (X, y) = make_data(120, 6, 16);
+        let params = RandomForestParameters::default()
+            .with_n_estimators(15)
+            .with_seed(16);
+        let mut forest = RandomForest::new(params);
+        forest.fit(&X.view(), &y.view());
+
+        let flat = FlatForest::from_forest(&forest, 6);
+        assert_eq!(
+            flat.nodes.len(),
+            flat.n_trees as usize * flat.max_tree_size as usize,
+            "nodes.len() should equal n_trees * max_tree_size"
+        );
+    }
+
+    /// Every slot beyond a tree's real BFS footprint must be a dummy leaf (test #15).
+    #[test]
+    fn padding_nodes_are_leaves() {
+        let (X, y) = make_data(150, 8, 15);
+        let params = RandomForestParameters::default()
+            .with_n_estimators(10)
+            .with_seed(15);
+        let mut forest = RandomForest::new(params);
+        forest.fit(&X.view(), &y.view());
+
+        let flat = FlatForest::from_forest(&forest, 8);
+        let n_trees = flat.n_trees as usize;
+        let max_tree_size = flat.max_tree_size as usize;
+
+        for tree_idx in 0..n_trees {
+            let offset = tree_idx * max_tree_size;
+            let tree_nodes = &flat.nodes[offset..offset + max_tree_size];
+            let real_count = count_bfs_nodes(tree_nodes);
+            for (i, node) in tree_nodes
+                .iter()
+                .enumerate()
+                .take(max_tree_size)
+                .skip(real_count)
+            {
+                assert!(
+                    node.left < 0,
+                    "tree {tree_idx}, slot {i} (beyond real size {real_count}): expected dummy leaf, got left={}",
+                    node.left
+                );
+            }
+        }
+    }
+
+    /// `max_tree_size` must equal the actual maximum node count, not the BFS positional
+    /// formula `2^(max_depth+1) - 1` (test #3). For unconstrained trees deep enough that
+    /// the positional layout would differ, the two values must diverge.
+    #[test]
+    fn max_tree_size_is_actual_count_not_bfs_formula() {
+        let (X, y) = make_data(150, 6, 42);
+        let params = RandomForestParameters::default()
+            .with_n_estimators(10)
+            .with_seed(42);
+        let mut forest = RandomForest::new(params);
+        forest.fit(&X.view(), &y.view());
+
+        let flat = FlatForest::from_forest(&forest, 6);
+
+        // Independent recomputation of max node count using the private helper.
+        let expected_max = forest
+            .trees()
+            .iter()
+            .map(|t| count_nodes(t.root()))
+            .max()
+            .unwrap();
+        assert_eq!(
+            flat.max_tree_size as usize, expected_max,
+            "max_tree_size should equal the actual max node count across trees"
+        );
+
+        // For trees with max_depth >= 4, the positional BFS layout would require
+        // at least 2^5 - 1 = 31 nodes, whereas typical trees with the same depth
+        // but sparse structure will have far fewer. Assert we use the compact count.
+        let bfs_formula = (1usize << (flat.max_depth as usize + 1)).saturating_sub(1);
+        if flat.max_depth >= 4 {
+            assert!(
+                (flat.max_tree_size as usize) < bfs_formula,
+                "max_tree_size ({}) should be less than BFS formula ({}) for depth-{} trees",
+                flat.max_tree_size,
+                bfs_formula,
+                flat.max_depth
+            );
+        }
+    }
+
+    /// Every padding node beyond a tree's real BFS footprint must have `value == 0.0` (test #5).
+    /// This verifies that `FlatNode::dummy_leaf()` initialises `value` to zero, so padding
+    /// slots cannot accidentally contribute non-zero predictions if the loop bound is wrong.
+    #[test]
+    fn dummy_leaf_value_is_zero() {
+        let (X, y) = make_data(150, 8, 50);
+        let params = RandomForestParameters::default()
+            .with_n_estimators(10)
+            .with_seed(50);
+        let mut forest = RandomForest::new(params);
+        forest.fit(&X.view(), &y.view());
+
+        let flat = FlatForest::from_forest(&forest, 8);
+        let max_tree_size = flat.max_tree_size as usize;
+
+        for tree_idx in 0..flat.n_trees as usize {
+            let offset = tree_idx * max_tree_size;
+            let tree_nodes = &flat.nodes[offset..offset + max_tree_size];
+            let real_count = count_bfs_nodes(tree_nodes);
+            for (i, node) in tree_nodes
+                .iter()
+                .enumerate()
+                .take(max_tree_size)
+                .skip(real_count)
+            {
+                assert_eq!(
+                    node.value, 0.0,
+                    "tree {tree_idx}, padding slot {i}: expected value=0.0"
+                );
+            }
+        }
+    }
+
+    /// Serializing then deserializing a FlatForest produces the same predictions.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_round_trip_predictions() {
+        let (X, y) = make_data(150, 6, 99);
+        let params = RandomForestParameters::default()
+            .with_n_estimators(10)
+            .with_seed(99);
+        let mut forest = RandomForest::new(params);
+        forest.fit(&X.view(), &y.view());
+        let flat = FlatForest::from_forest(&forest, 6);
+
+        let bytes = postcard::to_stdvec(&flat).unwrap();
+        let restored: FlatForest = postcard::from_bytes(&bytes).unwrap();
+
+        let X_f32 = X.mapv(|v| v as f32);
+        let original = flat.predict(&X_f32.view());
+        let from_serde = restored.predict(&X_f32.view());
+        assert_eq!(
+            original, from_serde,
+            "predictions must match after round-trip"
+        );
+    }
+
+    /// Compact serialization is smaller than the full padded node array.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_compact_smaller_than_padded() {
+        let (X, y) = make_data(150, 8, 77);
+        let params = RandomForestParameters::default()
+            .with_n_estimators(20)
+            .with_seed(77);
+        let mut forest = RandomForest::new(params);
+        forest.fit(&X.view(), &y.view());
+        let flat = FlatForest::from_forest(&forest, 8);
+
+        let compact_bytes = postcard::to_stdvec(&flat).unwrap();
+        let padded_bytes =
+            flat.meta.n_trees as usize * flat.meta.max_tree_size as usize * size_of::<FlatNode>();
+        assert!(
+            compact_bytes.len() < padded_bytes,
+            "compact serde ({} bytes) should be smaller than raw padded layout ({} bytes)",
+            compact_bytes.len(),
+            padded_bytes
+        );
+    }
+
+    /// Count reachable nodes from root via BFS using explicit child indices.
+    fn count_bfs_nodes(nodes: &[FlatNode]) -> usize {
+        use std::collections::VecDeque;
+        let mut queue = VecDeque::new();
+        queue.push_back(0usize);
+        let mut count = 0;
+        while let Some(idx) = queue.pop_front() {
+            if idx >= nodes.len() {
+                break;
+            }
+            count += 1;
+            let node = &nodes[idx];
+            if node.left >= 0 {
+                queue.push_back(node.left as usize);
+                queue.push_back(node.right as usize);
+            }
+        }
+        count
     }
 }
