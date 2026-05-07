@@ -206,12 +206,17 @@ impl GpuContext {
             .features()
             .contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS);
 
+        let adapter_limits = adapter.limits();
         let (device, queue): (wgpu::Device, wgpu::Queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 required_features: if uma {
                     wgpu::Features::MAPPABLE_PRIMARY_BUFFERS
                 } else {
                     wgpu::Features::empty()
+                },
+                required_limits: wgpu::Limits {
+                    max_storage_buffer_binding_size: adapter_limits.max_storage_buffer_binding_size,
+                    ..Default::default()
                 },
                 ..Default::default()
             })
